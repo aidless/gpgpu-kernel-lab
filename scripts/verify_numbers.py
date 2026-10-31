@@ -1,0 +1,124 @@
+"""复算闸：把 README / 文档里写的每个数字从代码重算一遍，不一致就 exit 1。
+
+用法：
+    PYTHONPATH=src python3 scripts/verify_numbers.py
+
+为什么要有这个文件：文档里的数字会漂移——改了 kernel，README 里的 74112 没跟着改，
+读者就会读到一句「有出处的假话」。铁律是「任何百分数/字节数必须能从落盘证据重算」，
+这个脚本就是那条铁律的可执行版本。它同时也是 AGENTS「门必须能失败」的实践：
+把任意一个期望值改错（值本身在 EXPECTED 里），脚本必须 exit≠0。
+"""
+
+from __future__ import annotations
+
+import sys
+
+import numpy as np
+
+from gkern.gpgpu.device import DeviceInfo
+from gkern.gpgpu.memory import count_transactions
+from gkern.gpgpu.samples import run_sample, vec_add_coalesced, vec_add_strided
+from gkern.ops import run_fused_mlp
+
+dev = DeviceInfo()
+
+# ---- 期望值表（唯一真相；改这里 = 改文档里的数字） ----------------------
+EXPECTED = {
+    "peak_flops_tflops": 26.2144,
+    "bandwidth_gbps": 102.4,
+    "roofline_crossover": 256.0,
+    "coalesced_load_transactions": 64,
+    "strided_load_transactions": 2048,
+    "transaction_amplification": 32,
+    "divergence_rate_mixed": 1.0,
+    "divergence_rate_positive": 0.0,
+    "lane_efficiency_mixed_rounded": 0.667,
+    "fusion_unfused_bytes": 74112,
+    "fusion_fused_bytes": 49536,
+    "fusion_saved_bytes": 24576,
+}
+
+failures: list[str] = []
+
+
+def check(name: str, got, want) -> None:
+    ok = (abs(got - want) < 1e-6) if isinstance(want, float) else (got == want)
+    print(f"{'ok  ' if ok else 'FAIL'} {name}: got={got!r} want={want!r}")
+    if not ok:
+        failures.append(name)
+
+
+# 1. 设备模型（解析值）
+check("peak_flops_tflops", round(dev.peak_flops_tflops, 4), EXPECTED["peak_flops_tflops"])
+check("bandwidth_gbps", round(dev.theoretical_bandwidth_gbps, 2), EXPECTED["bandwidth_gbps"])
+check("roofline_crossover",
+      round(dev.peak_flops_tflops * 1e12 / (dev.theoretical_bandwidth_gbps * 1e9), 1),
+      EXPECTED["roofline_crossover"])
+
+# 2. 合并访存：同一份数据、两种访问形态
+n = 1024
+coal, _, _ = run_sample(vec_add_coalesced, n=n)
+strid, _, _ = run_sample(vec_add_strided, n=n)
+cs, ss = coal.summary(), strid.summary()
+check("coalesced_load_transactions",
+      cs["global_load_transactions"], EXPECTED["coalesced_load_transactions"])
+check("strided_load_transactions",
+      ss["global_load_transactions"], EXPECTED["strided_load_transactions"])
+check("byte_requests_identical",
+      cs["global_bytes_requested"] == ss["global_bytes_requested"], True)
+check("transaction_amplification",
+      ss["global_load_transactions"] // cs["global_load_transactions"],
+      EXPECTED["transaction_amplification"])
+
+# 3. 分支发散
+from gkern.gpgpu.samples import relu_branchy  # noqa: E402
+
+rng = np.random.default_rng(0)
+mixed, _, _ = run_sample(relu_branchy, n=n)
+ms = mixed.summary()
+check("divergence_rate_mixed", ms["divergence_rate"], EXPECTED["divergence_rate_mixed"])
+check("lane_efficiency_mixed_rounded",
+      round(ms["warp_efficiency"], 3), EXPECTED["lane_efficiency_mixed_rounded"])
+
+# 4. 融合省访存（等式，不是估计）
+m, k, nn = 64, 32, 48
+a = rng.standard_normal((m, k)).astype(np.float32)
+w = rng.standard_normal((k, nn)).astype(np.float32)
+bias = rng.standard_normal(nn).astype(np.float32)
+fused = run_fused_mlp(a, w, bias, bm=32, bn=16, bk=16, fuse=True)
+unfused = run_fused_mlp(a, w, bias, bm=32, bn=16, bk=16, fuse=False)
+check("fusion_unfused_bytes", unfused.cost.bytes_total, EXPECTED["fusion_unfused_bytes"])
+check("fusion_fused_bytes", fused.cost.bytes_total, EXPECTED["fusion_fused_bytes"])
+check("fusion_saved_bytes",
+      unfused.cost.bytes_total - fused.cost.bytes_total, EXPECTED["fusion_saved_bytes"])
+check("fusion_saved_equals_2_times_C",
+      unfused.cost.bytes_total - fused.cost.bytes_total == 2 * m * nn * 4, True)
+check("fusion_numerically_equal",
+      bool(np.allclose(fused.output, unfused.output, atol=1e-5)), True)
+
+# 5. 事务计数函数本身的 128B 分段语义（防「计数尺」漂移）
+check("count_transactions_128B_split",
+      count_transactions(np.array([0, 128, 256], dtype=np.int64)), 3)
+check("count_transactions_same_segment",
+      count_transactions(np.array([0, 4, 8], dtype=np.int64)), 1)
+
+# ---- 自检：闸必须能失败（AGENTS「门必须能失败」） ----------------------
+if "--selftest" in sys.argv:
+    # 故意把一项期望值改错，再跑同一套检查，必须报错才算闸有效。
+    EXPECTED["fusion_saved_bytes"] += 1
+    failures.clear()
+    unfused2 = run_fused_mlp(a, w, bias, bm=32, bn=16, bk=16, fuse=False)
+    fused2 = run_fused_mlp(a, w, bias, bm=32, bn=16, bk=16, fuse=True)
+    check("selftest_injected_wrong_value",
+          unfused2.cost.bytes_total - fused2.cost.bytes_total,
+          EXPECTED["fusion_saved_bytes"])
+    if failures:
+        print("\nselftest ok：注入错误期望值后闸确实红了。")
+        sys.exit(0)
+    print("\nselftest FAILED：注入错误期望值后闸仍然是绿的——这个闸是装饰。")
+    sys.exit(2)
+
+if failures:
+    print(f"\n{len(failures)} 项不一致：{failures}")
+    sys.exit(1)
+print("\n全部数字复算通过。")

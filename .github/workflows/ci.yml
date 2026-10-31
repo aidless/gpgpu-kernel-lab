@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install CPU-only torch
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+      - name: Install package
+        run: pip install -e ".[dev]"
+      - name: Run tests
+        run: pytest -q
+      - name: Run quickstart example
+        run: python examples/quickstart.py
+        env:
+          PYTHONPATH: src
+      - name: Verify every documented number is recomputable
+        run: python scripts/verify_numbers.py
+        env:
+          PYTHONPATH: src
+      - name: Prove the number gate can actually fail
+        run: python scripts/verify_numbers.py --selftest
+        env:
+          PYTHONPATH: src
+      - name: Run benchmarks (smoke, writes results/)
+        run: python benchmarks/run_benchmarks.py
+        env:
+          PYTHONPATH: src
+      - name: Assert the fusion byte equality still holds
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          rows = json.loads(pathlib.Path("benchmarks/results/bench.json").read_text())["fusion"]
+          ok = [r for r in rows if r["match"]]
+          assert len(ok) >= 3, rows
+          assert all(r["outputs_close"] for r in rows), rows
+          print("fusion等式与数值一致性均通过：", len(ok), "行 match=True")
+          PY
