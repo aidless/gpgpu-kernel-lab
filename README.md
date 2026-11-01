@@ -41,11 +41,20 @@
 
 ```bash
 cd gpgpu-kernel-lab
-pip install -e ".[dev]"          # numpy + torch + pytest
-pytest                            # 115 个测试函数（pytest 收集 134 条用例）
+# 方式 A（推荐，避免 PEP 668 externally-managed 报错）：源码直跑，不安装
+PYTHONPATH=src python3 -m pytest            # 134 个用例通过（含 C++ 扩展；未构建扩展时 112 passed + 1 模块级 skip）
 PYTHONPATH=src python3 examples/quickstart.py
 PYTHONPATH=src python3 benchmarks/run_benchmarks.py
+
+# 方式 B（正常 venv 内）：editable 安装后直接 pytest
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"                       # numpy + torch + pytest（可再加 pybind11）
+pytest                                        # 同上 134 个用例
 ```
+
+2026-11-01 实测：宿主机是 PEP 668 externally-managed（`pip install -e .` 被拒），
+所以**方式 A 是在这台机器上的可靠路径**——`PYTHONPATH=src` 让 `pytest`、
+`examples/quickstart.py`、`benchmarks/run_benchmarks.py` 三个入口都无需安装即可跑。
 
 `examples/quickstart.py` 会依次打印：设备模型、访存合并对比、分支发散、
 六个算子的 IR 与代价、融合省下的字节、`torch.compile` 融合结论。
@@ -300,7 +309,7 @@ softmax 在四个位置降精度（输入、行最大值、指数结果、归约
 ## 测试与自检闸
 
 ```bash
-pytest                                    # 134 passed（含 C++ 扩展；未构建扩展时 112 passed + 1 个模块级 skip）
+PYTHONPATH=src python3 -m pytest              # 134 passed（含 C++ 扩展；未构建扩展时 112 passed + 1 个模块级 skip）
 PYTHONPATH=src python3 scripts/verify_numbers.py            # 重算文档里每个数字
 PYTHONPATH=src python3 scripts/verify_numbers.py --selftest # 证明这个闸会红
 ```
