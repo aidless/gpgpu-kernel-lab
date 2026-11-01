@@ -214,6 +214,11 @@ softmax 在四个位置降精度（输入、行最大值、指数结果、归约
 数值决策，而不像很多人以为的那样是性能决策。误差大了约 10 万倍这件事，被写成了
 `tests/test_mixed_precision.py` 的断言，防止哪天实现偷偷没降精度却还挂着 bf16 的名字。
 
+**这一格在真实 GPU 上还没量**（Kaggle 每周 GPU 额度 2026-11-01 已用尽：32.75h/30h、
+剩余 0.00h，`kaggle kernels push` 被平台拒绝）。脚本 `benchmarks/triton/bench_bf16_softmax.py`
+已提交、可直接跑，缺口与补齐命令写在 `docs/cloud-reconciliation.md` 最后一节——
+不写「应该差不多」这种话。
+
 ---
 
 **云端实测：T4 上量一次，再回头问模型准不准**
