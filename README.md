@@ -42,7 +42,7 @@
 ```bash
 cd gpgpu-kernel-lab
 pip install -e ".[dev]"          # numpy + torch + pytest
-pytest                            # 104 个测试，约 24 秒
+pytest                            # 115 个测试函数（pytest 收集 134 条用例）
 PYTHONPATH=src python3 examples/quickstart.py
 PYTHONPATH=src python3 benchmarks/run_benchmarks.py
 ```
@@ -182,6 +182,40 @@ torch.empty(4, device="gkern")          # NotImplementedError ← 刻意的
 
 ---
 
+**C++ 侧：同一份语义的第二实现，以及它与 Python 的语义差**
+
+`csrc/gkern_cpp.cpp` 把两个最热的访存判据（事务计数、bank 冲突）用原生代码重写一遍，
+通过 pybind11 暴露成可选扩展 `gkern_cpp`：
+
+```bash
+pip install pybind11 && pip install -e ".[cpp]" --no-build-isolation
+PYTHONPATH=src python3 scripts/verify_cpp.py
+```
+
+`scripts/verify_cpp.py` 是硬门禁：模块缺失直接 `exit 2`（不允许「没构建就算通过」），
+存在时跑 1200 组随机/边界输入的逐值对拍，再量一次同工作量的耗时
+（1M 偏移：`count_transactions` 约 9×、`warp_bank_conflicts` 约 33×，本机 Ryzen 7 5800H）。
+
+写这份代码暴露的真问题不是性能，而是**跨语言语义差**：Python 的 `//` 向下取整，
+C++ 的 `/` 向零截断，`[-1, -128, -129, 0]` 在 Python 里是 3 个事务段、在朴素的 C++
+里是 2 个。`csrc/gkern_cpp.cpp` 里因此手写了 `floor_div`——这是坑 #11。
+
+**混合精度：精度是免费的，但必须显式选**
+
+`gkern.ops.mixed_precision` 把「累加精度」写成 IR 里的显式舍入点（`tl.round_bf16`），
+softmax 在四个位置降精度（输入、行最大值、指数结果、归约和）。实测同一个 256×1024 输入：
+
+| 累加精度 | 最大绝对误差 | 访存 (B) | FLOP |
+|---|---:|---:|---:|
+| fp32 | 5.96e-08 | 4194304 | 2621440 |
+| bf16 | 5.87e-03 | 4194304 | 3671040 |
+
+访存字节**完全相同**、FLOP 只多四次舍入——所以「用不用 bf16 累加」是一个纯粹的
+数值决策，而不像很多人以为的那样是性能决策。误差大了约 10 万倍这件事，被写成了
+`tests/test_mixed_precision.py` 的断言，防止哪天实现偷偷没降精度却还挂着 bf16 的名字。
+
+---
+
 **云端实测：T4 上量一次，再回头问模型准不准**
 
 本仓库其他数字都是 CPU 上可复算的机制演示；唯独这一节是**真实 GPU 实测**，
@@ -261,7 +295,7 @@ torch.empty(4, device="gkern")          # NotImplementedError ← 刻意的
 ## 测试与自检闸
 
 ```bash
-pytest                                    # 104 passed
+pytest                                    # 134 passed（含 C++ 扩展；未构建扩展时 112 passed + 22 skipped）
 PYTHONPATH=src python3 scripts/verify_numbers.py            # 重算文档里每个数字
 PYTHONPATH=src python3 scripts/verify_numbers.py --selftest # 证明这个闸会红
 ```
@@ -283,6 +317,12 @@ README/文档里出现的每个数值（26.2144 TFLOPS、102.4 GB/s、64/2048 �
   非 CPU 张量与符号维度在 `try_lower` 就干净回退、`explain(obj)` 只回答**该对象**的结论。
 - `tests/test_smem.py`：共享内存分块的**反直觉不变量**（字节数必须与 global-only 完全相等）、
   bank 冲突按 warp 分组的 992/0 两档、复用上界只在 n≥1536 才翻成 compute。
+- `tests/test_cpp_kernels.py`：C++ 扩展（`gkern_cpp`）与 numpy 参考实现**逐值对拍**——
+  含负偏移这条跨语言语义差（Python 的 `//` 向下取整、C++ 的 `/` 向零截断，
+  `[-1,-128,-129,0]` 是 3 段而不是 2 段）、尾块不足 32 lane 时的 warp 冲突计数。
+- `tests/test_mixed_precision.py`：`round_bf16` 与 `torch.bfloat16` 的**位模式级**一致
+  （含 tie-to-even 与 NaN/Inf）、bf16 累加的误差比 fp32 大 100 倍以上、
+  两条路径的访存字节完全相同而 FLOP 只多四次舍入。
 - `tests/test_package.py`：公开 API 契约（`from gkern.torch_ext import register_backend`
   必须真的可用——这个包曾一度缺 `__init__.py`，`import gkern` 正常但公开名字导入失败）。
 

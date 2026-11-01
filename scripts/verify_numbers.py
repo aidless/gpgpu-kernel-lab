@@ -49,6 +49,10 @@ EXPECTED = {
     "t4_crossover_rounded": 25.44,
     "t4_measured_over_predicted_4096": 1.398,
     "t4_speedup_vs_eager_512": 0.741,
+    # 混合精度（bf16 累加）—— 舍入必须与 torch.bfloat16 逐位一致
+    "bf16_round_tie_down": 1.0,
+    "bf16_round_tie_up": 1.015625,
+    "bf16_error_ratio_floor": 10000,
 }
 
 failures: list[str] = []
@@ -124,33 +128,29 @@ check("fusion_numerically_equal",
 
 # 4b. 文档里的测试数必须与真实收集数一致（漂移过两次：58→68→74）
 #     数字类文档断言最容易腐烂，所以把它也做成可复算项，而不是靠人记得改。
+import ast  # noqa: E402
 import pathlib  # noqa: E402
 import re  # noqa: E402
-import subprocess  # noqa: E402
 
 _root = pathlib.Path(__file__).resolve().parent.parent
-_collected = subprocess.run(
-    [sys.executable, "-m", "pytest", "tests", "-o", "addopts=", "--collect-only", "-q"],
-    cwd=_root, capture_output=True, text=True,
-    # 注意：不能传绝对 PYTHONPATH——本机工作区目录名是 ``F:\deepseek``，
-    # 里面含一个冒号，会被 os.pathsep 拆成两段，导致 3 个测试模块 import 失败、
-    # 收集数被算成 20。用相对路径 + cwd 才是稳的（CI 上同理）。
-    env={**__import__("os").environ, "PYTHONPATH": "src"},
-)
-_tail = re.search(r"(\d+) tests collected", _collected.stdout)
-if _tail is None:
-    print("FAIL test_count_unreadable: 无法从 pytest --collect-only 输出里读到用例数")
-    print(_collected.stdout[-2000:])
-    sys.exit(2)
-_real_count = int(_tail.group(1))
+
+# 判定用「测试函数个数」而不是「pytest 收集到的用例数」：后者会随可选扩展是否
+# 构建而变（C++ 扩展未构建时 22 条用例整模块跳过），把它当文档数就会让同一条
+# 闸在不同机器上给出不同结论。函数个数是源码的性质，机器无关。
+_func_count = 0
+for _f in sorted((_root / "tests").glob("test_*.py")):
+    _tree = ast.parse(_f.read_text(encoding="utf-8"))
+    _func_count += sum(1 for node in _tree.body
+                       if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"))
+
 for doc in ("README.md", "docs/jd-mapping.md"):
     text = (_root / doc).read_text(encoding="utf-8")
-    claimed = re.search(r"(\d+) 个测试", text)
+    claimed = re.search(r"(\d+) 个测试函数", text)
     if claimed is None:
         failures.append(f"{doc}_test_count_missing")
-        print(f"FAIL {doc}_test_count_missing: 文档里找不到「N 个测试」")
+        print(f"FAIL {doc}_test_count_missing: 文档里找不到「N 个测试函数」")
         continue
-    check(f"doc_test_count[{doc}]", int(claimed.group(1)), _real_count)
+    check(f"doc_test_count[{doc}]", int(claimed.group(1)), _func_count)
 
 # 4c. 共享内存：不改全局字节、bank 冲突按 warp 分组、复用上界只在 n>=1536 翻转
 from gkern.compiler import compile_kernel, costmodel  # noqa: E402
@@ -215,6 +215,24 @@ check("t4_measured_over_predicted_4096",
 _r512 = next(r for r in _ev["rows"] if r["cols"] == 512)
 check("t4_speedup_vs_eager_512", _r512["speedup_vs_eager"],
       EXPECTED["t4_speedup_vs_eager_512"])
+
+# 4e. 混合精度：舍入语义 + 精度代价
+from gkern.compiler.codegen import _bf16_round as _r16  # noqa: E402
+from gkern.ops.mixed_precision import run_softmax_precision as _prec  # noqa: E402
+
+_tie_down = np.float32(1.0) + np.float32(2.0 ** -8)
+_tie_up = np.float32(1.0) + np.float32(3 * 2.0 ** -8)
+_rounded = _r16(np.array([_tie_down, _tie_up], np.float32))
+check("bf16_round_tie_down", float(_rounded[0]), EXPECTED["bf16_round_tie_down"])
+check("bf16_round_tie_up", float(_rounded[1]), EXPECTED["bf16_round_tie_up"])
+
+_rng16 = np.random.default_rng(20261101)
+_x16 = (_rng16.standard_normal((256, 1024)) * 3.0).astype(np.float32)
+_p32 = _prec(_x16, accumulate="fp32")
+_p16 = _prec(_x16, accumulate="bf16")
+check("precision_bytes_equal", _p16.cost.bytes_total == _p32.cost.bytes_total, True)
+check("precision_error_ratio_floor",
+      bool(_p16.max_error / _p32.max_error > EXPECTED["bf16_error_ratio_floor"]), True)
 
 # 5. 事务计数函数本身的 128B 分段语义（防「计数尺」漂移）
 check("count_transactions_128B_split",

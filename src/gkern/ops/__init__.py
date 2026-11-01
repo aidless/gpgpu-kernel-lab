@@ -13,12 +13,14 @@ import numpy as np
 
 from ..compiler import codegen, compile_kernel, costmodel
 from ..compiler import dsl as tl
-from . import elementwise, matmul, smem, softmax
+from . import elementwise, matmul, mixed_precision, smem, softmax
+from .mixed_precision import precision_summary, run_softmax_precision
 
 __all__ = [
-    "elementwise", "softmax", "matmul",
+    "elementwise", "softmax", "matmul", "smem", "mixed_precision",
     "run_vector_add", "run_scale_gelu", "run_softmax", "run_layernorm",
     "run_matmul", "run_fused_mlp", "run_smem_column", "OpResult",
+    "run_softmax_precision", "precision_summary",
 ]
 
 

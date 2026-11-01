@@ -206,6 +206,14 @@ class _Tracer:
     def tanh(self, a: Tile) -> Tile:
         return self._unary("tanh", a)
 
+    def round_bf16(self, a: Tile) -> Tile:
+        """把一个 float32 tile 舍入到 bfloat16 精度（8 位尾数）再返回 float32。
+
+        用来显式表达「累加器精度」这件事：真实实现里 bf16 累加就是每步
+        舍入一次，误差由这里产生。
+        """
+        return self._unary("round_bf16", a)
+
     # ---- 归约与矩阵乘 ---------------------------------------------------
     def sum(self, a: Tile, axis: int, keep_dims: bool = False) -> Tile:
         shape = list(a.shape)
@@ -364,6 +372,10 @@ def rsqrt(x: Tile) -> Tile:
 
 def tanh(x: Tile) -> Tile:
     return _t().tanh(x)
+
+
+def round_bf16(x: Tile) -> Tile:
+    return _t().round_bf16(x)
 
 
 def maximum(a: Any, b: Any) -> Tile:

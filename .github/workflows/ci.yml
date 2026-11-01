@@ -24,6 +24,16 @@ jobs:
           pip install --index-url https://download.pytorch.org/whl/cpu torch
       - name: Install package
         run: pip install -e ".[dev]"
+      # build isolation 里没有 pybind11，setup.py 会静默跳过扩展；必须 --no-build-isolation，
+      # 否则「测试通过」里混着 22 条被跳过的 C++ 用例（详见 README 坑 #12）。
+      - name: Build the optional C++ extension
+        run: |
+          pip install pybind11
+          pip install -e ".[cpp]" --no-build-isolation
+      - name: Verify the C++ extension actually got built and matches numpy
+        run: python scripts/verify_cpp.py
+        env:
+          PYTHONPATH: src
       - name: Run tests
         run: pytest -q
       - name: Run quickstart example
@@ -46,7 +56,7 @@ jobs:
         run: python benchmarks/analyze_triton.py
         env:
           PYTHONPATH: src
-      - name: Assert smem byte equality and warp-level bank conflicts
+      - name: Assert smem bytes, warp-level bank conflicts, and bf16 precision accounting
         run: |
           python - <<'PY'
           import json, pathlib
@@ -57,7 +67,13 @@ jobs:
           assert bank[32] == 992 and bank[33] == 0, bank
           reuse = {r["n"]: r["reuse_bound"] for r in data["reuse"]}
           assert reuse[2048] == "compute", reuse
-          print("smem 字节相等 / bank 992-0 / 复用上界 n=2048 compute 均通过")
+          # 混合精度：两条累加路径的访存必须完全相等，而 bf16 的误差必须明显更大
+          prec = {(r["shape"], r["accumulate"]): r for r in data["precision"]}
+          for shape in ("256x512", "512x1024"):
+              a, b = prec[(shape, "fp32")], prec[(shape, "bf16")]
+              assert a["bytes"] == b["bytes"], (a, b)
+              assert float(b["max_error"]) > 100 * float(a["max_error"]), (a, b)
+          print("smem 字节相等 / bank 992-0 / 复用上界 n=2048 compute / bf16 误差与字节 均通过")
           PY
       - name: Assert the fusion byte equality still holds
         run: |

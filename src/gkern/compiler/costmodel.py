@@ -105,7 +105,7 @@ def analyze(program: Program, device: DeviceInfo | None = None) -> Cost:
             # 不排除它的话，GEMM 的 AI 会被偏移量计算抬高约 4.8%，roofline 判定跟着漂。
             if np.issubdtype(node.dtype, np.floating):
                 flops += node.numel
-        elif node.op in ("exp", "log", "sqrt", "rsqrt", "neg", "tanh"):
+        elif node.op in ("exp", "log", "sqrt", "rsqrt", "neg", "tanh", "round_bf16"):
             # 先按 1 FLOP 计，实际 SFU 吞吐低得多；这里只用于「是否算力受限」的量级判断
             if np.issubdtype(node.dtype, np.floating):
                 flops += node.numel

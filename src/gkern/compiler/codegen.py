@@ -59,6 +59,24 @@ def _gelu_exact(x):
     return 0.5 * x * (1.0 + erf(x / np.sqrt(2.0)))
 
 
+def _bf16_round(x):
+    """把 float32 按 IEEE 的 round-half-to-even 截到 bfloat16 再升回 float32。
+
+    这就是 ``x.to(torch.bfloat16).float()`` 的语义：bfloat16 只有 8 位尾数，
+    所以「舍入」本身是一个真实存在的 ALU 操作，不是记账细节。指数全 1 的
+    NaN/Inf 走特例分支——直接加 round 常量会把 NaN 改成 Inf。
+    """
+    a = np.asarray(x, dtype=np.float32)
+    u = a.view(np.uint32).copy()
+    rounding = np.uint32(0x7FFF) + ((u >> np.uint32(16)) & np.uint32(1))
+    u = (u + rounding) & np.uint32(0xFFFF0000)
+    out = u.view(np.float32)
+    special = ~np.isfinite(a)
+    if special.any():
+        out[special] = a[special]
+    return out
+
+
 _UNARY = {
     "exp": np.exp,
     "log": np.log,
@@ -68,6 +86,7 @@ _UNARY = {
     "tanh": np.tanh,
     "relu": _relu,
     "sigmoid": _sigmoid,
+    "round_bf16": _bf16_round,
     "gelu": _gelu_exact,
 }
 

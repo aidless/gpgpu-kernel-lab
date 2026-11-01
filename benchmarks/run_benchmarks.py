@@ -22,8 +22,8 @@ import time
 import numpy as np
 
 from gkern.compiler import compile_kernel, costmodel
-from gkern.ops import (matmul, run_fused_mlp, run_matmul, run_smem_column,
-                       run_softmax, run_vector_add)
+from gkern.ops import (matmul, precision_summary, run_fused_mlp, run_matmul,
+                       run_smem_column, run_softmax, run_vector_add)
 
 OUT_DIR = pathlib.Path(__file__).resolve().parent / "results"
 
@@ -166,10 +166,22 @@ def main() -> None:
             "reuse_bound": upper.bound,
         })
 
+    # 混合精度：同一条 softmax 的两种累加精度，误差与代价并排看
+    precision_rows = []
+    for shape in ((256, 512), (512, 1024)):
+        x = (np.random.default_rng(sum(shape)).standard_normal(shape) * 2.0).astype(np.float32)
+        for row in precision_summary(x):
+            precision_rows.append({"shape": f"{shape[0]}x{shape[1]}",
+                                   "max_error": f"{row['max_error']:.3e}",
+                                   "mean_error": f"{row['mean_error']:.3e}",
+                                   "bytes": row["bytes"], "flops": row["flops"],
+                                   **row})
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     (OUT_DIR / "bench.json").write_text(
         json.dumps({"kernels": rows, "fusion": fusion_rows, "smem": smem_rows,
-                    "bank": bank_rows, "reuse": reuse_rows},
+                    "bank": bank_rows, "reuse": reuse_rows,
+                    "precision": precision_rows},
                    indent=2, ensure_ascii=False),
         encoding="utf-8")
 
@@ -203,6 +215,12 @@ def main() -> None:
     for r in reuse_rows:
         lines.append(f"| {r['n']} | {r['lower_bytes']} | {r['lower_ai']} | {r['lower_bound']} | "
                      f"{r['reuse_bytes']} | {r['reuse_ai']} | {r['reuse_bound']} |")
+    lines.append("")
+    lines.append("| shape | 累加精度 | 最大绝对误差 | 平均绝对误差 | 访存 (B) | FLOP |")
+    lines.append("|---|---|---:|---:|---:|---:|")
+    for r in precision_rows:
+        lines.append(f"| {r['shape']} | {r['accumulate']} | {r['max_error']} | "
+                     f"{r['mean_error']} | {r['bytes']} | {r['flops']} |")
     table = "\n".join(lines)
     (OUT_DIR / "bench.md").write_text(table + "\n", encoding="utf-8")
     print(table)
