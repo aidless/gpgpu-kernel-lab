@@ -28,7 +28,7 @@
 |---|---|---|
 | a. CPU/GPU 算子优化、并行计算背景 | `ops/matmul.py` 分块 GEMM + `matmul_smem` 共享内存分块 + `autotune` 枚举；合并访存 32× 事务差、发散 lane 效率 0.667、bank 冲突 992 vs 0（行宽 32/33）、复用上界 `AI = N/6 + N/192` 的实测；`SGEMM_CUDA` 优化阶梯（1→12 级）阅读路径 | 覆盖（模型级） |
 | b. TVM/MLIR/XLA/Triton 编译或图算优化 | `compiler/` 自建最小编译栈：DSL → IR → pass（融合/分块）→ codegen + 代价模型；`docs/ecosystem.md` C 节给出 MLIR Linalg / TVM `s_tir` / IREE codegen 的**当前有效源码路径**（TVM 2026 已重构，旧教程路径 404） | 覆盖 |
-| c. 国产加速卡经验 | 无（本机无 GPU，Triton 无 CPU driver，远程主机无卡） | 缺口（硬缺口） |
+| c. 国产加速卡经验 | 无**上卡经验**（本机无 GPU，Triton 无 CPU driver，远程主机无卡）；但有源码级对照：`docs/domestic-card-notes.md` 逐行比对 `vllm-ascend` / `Ascend/pytorch` 与 CUDA FA 的分块、dtype、同步、融合边界，并逐条判定本仓库哪几条假设在 NPU 上失效 | 缺口（硬缺口：仍无真卡） |
 | d. 异构集群经验 | 无 | 缺口 |
 | e. 大模型优化经验 | 融合/roofline/attention 的算子级能力 + `docs/ecosystem.md` 的 `vllm/platforms`、`vllm-ascend/attention` 阅读清单 | 部分 |
 

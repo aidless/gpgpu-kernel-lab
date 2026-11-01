@@ -307,6 +307,8 @@ README/文档里出现的每个数值（26.2144 TFLOPS、102.4 GB/s、64/2048 �
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)：三档保真度、IR 为什么是线性指令表、融合不变量的边界、三个扩展点。
 - [docs/jd-mapping.md](docs/jd-mapping.md)：招聘要求 ↔ 本仓库可运行证据逐条对照，**含三个必须承认的缺口**。
 - [docs/ecosystem.md](docs/ecosystem.md)：正表 30 行 / 28 个唯一仓库，附表 21 行 / 相对正表新增 19 个，全文 51 行 / 47 个唯一仓库（全部 2026-10-31 用 GitHub API 复核）逐个用 GitHub API 验真，含源码入口级阅读路径与失效路径说明。
+- [docs/cloud-reconciliation.md](docs/cloud-reconciliation.md)：唯一的硬件实测证据（T4）与代价模型的对账，含「手写 softmax 没赢过 eager」这条不舒服的结论。
+- [docs/domestic-card-notes.md](docs/domestic-card-notes.md)：国产卡（昇腾/vllm-ascend）与 CUDA 侧的 attention 源码对照，逐条判定本仓库哪几条建模假设在 NPU 上直接失效。
 - [benchmarks/results/bench.md](benchmarks/results/bench.md)：最近一次基准输出（数值墙钟 × 模型预测 × 受限类型 × 融合等式）。
 
 ## 许可证
