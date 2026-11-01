@@ -23,18 +23,18 @@ CUDA 侧的 tile 是**编译期模板参数**，写在可读源码里，能被�
 - `Dao-AILab/flash-attention/csrc/flash_attn/src/flash_fwd_launch_template.h:173-184`：split-KV 路径固定 `kBlockM = 64`，`kBlockN = Headdim <= 64 ? 256 : (Headdim <= 128 ? 128 : 64)`；183 行注释写明 headdim 96 配 64×256、headdim 192 配 64×128 会让 nvcc segfault，所以分块不只是性能旋钮，还是编译器约束。
 - `Dao-AILab/flash-attention/csrc/flash_attn/src/flash_fwd_kernel.h:67-68` 从 `Kernel_traits` 取 `kBlockM/kBlockN`；90-94 行按 `window_size_left/right` 与 `actual_seqlen_k` 动态算 `n_block_min/n_block_max`；149-150 行 `local_tile(..., Shape<Int<kBlockM>, Int<kHeadDim>>{}, ...)` 把 m、n 两维 tile 显式展开。这三处合起来说明：**m/n 二维分块在 CUDA kernel 内是可见、可改、可自动搜索的量。**
 
-上层也把它当参数：`vllm-project/vllm/vllm/v1/attention/backends/flash_attn.py:93-95` 定义 `FA4_DENSE_Q_TILE = 128`、`FA4_DENSE_NUM_BLOCKS = 256`、`FA4_DENSE_MAX_SEQLEN_K = 8192`。
+上层也把它当参数：`vllm-project/vllm/vllm/v1/attention/backends/flash_attn.py:92-94` 定义 `FA4_DENSE_Q_TILE = 128`、`FA4_DENSE_NUM_BLOCKS = 256`、`FA4_DENSE_MAX_SEQLEN_K = 8192`。
 
 NPU 侧同一件事只剩三个**整数枚举型**旋钮，没有 tile 形状：
 
-1. page 粒度：`vllm-project/vllm-ascend/vllm_ascend/attention/attention_v1.py:153-155` 的 `get_supported_kernel_block_sizes()` 直接 `return [128]`，是唯一取值；KV cache 形状由它推（同文件 116-124），每请求块数 `cdiv(max_model_len, 128)`（270-272）。MLA 的 TND 路径反过来不用 paged：`vllm-project/vllm-ascend/vllm_ascend/attention/mla_v1.py:1745` 传 `"block_size": 0`。
+1. page 粒度：`vllm-project/vllm-ascend/vllm_ascend/attention/attention_v1.py:153-155` 的 `get_supported_kernel_block_sizes()` 直接 `return [128]`，是唯一取值；KV cache 形状由它推（同文件 116-124），每请求块数 `cdiv(max_model_len, 128)`（270-272）。MLA 的 TND 路径反过来不用 paged：`vllm-project/vllm-ascend/vllm_ascend/attention/mla_v1.py:1712` 传 `"block_size": 0`。
 2. mask 模式：`vllm-project/vllm-ascend/vllm_ascend/attention/attention_v1.py:671-673` 写 `sparse_mode = 4 if self.sliding_window else 3 if attn_metadata.causal else 0`，滑窗上下界走 `pre_tokens/next_tokens`，非滑窗时填 `SWA_INT_MAX = 2147483647`（同文件 70 行）。
 3. workspace：尺寸不固定，必须先向 op 问最大占用再下发：`vllm-project/vllm-ascend/vllm_ascend/attention/attention_v1.py:702-724` 调 `torch_npu._npu_fused_infer_attention_score_get_max_workspace(...)`；`vllm-project/vllm-ascend/vllm_ascend/attention/mla_v1.py:2970-2973` 调 `_npu_fused_infer_attention_score_v2_get_max_workspace`。
 
 真正约束分块形状的硬限制，源码里写得很直白：
 
 - 头数必须 pad 到 2 的幂：`vllm-project/vllm-ascend/vllm_ascend/attention/mla_v1.py:1056-1060`，注释给了反例（GLM-4.7-Flash 的 20 头），`num_heads_padded = 1 << (self.num_heads - 1).bit_length()`，`head_padding = num_heads_padded - num_heads`。CUDA FA 侧没有这条。
-- 单请求 token 上限 16：`vllm-project/vllm-ascend/vllm_ascend/attention/attention_v1.py:329-332` 对 `decode_threshold` 断言 `<= 16`，断言文案写明这是 FIA TND layout 的限制；`vllm-project/vllm-ascend/vllm_ascend/attention/mla_v1.py:529` 的 `FIA_SEQ_LEN_LIMIT = 16` 把 `actual_seq_lengths_q` 均匀插值到不超 16（同文件 508-530 的 docstring 给的是 `[1,2,...,16,32,36]`）。
+- 单请求 token 上限 16：`vllm-project/vllm-ascend/vllm_ascend/attention/attention_v1.py:278-281` 对 `decode_threshold` 断言 `<= 16`，断言文案写明这是 FIA TND layout 的限制；`vllm-project/vllm-ascend/vllm_ascend/attention/mla_v1.py:529` 的 `FIA_SEQ_LEN_LIMIT = 16` 把 `actual_seq_lengths_q` 均匀插值到不超 16（同文件 508-530 的 docstring 给的是 `[1,2,...,16,32,36]`）。
 - chunk 归约上限 16 对：`vllm-project/vllm-ascend/vllm_ascend/attention/mla_v1.py:1652-1657`，`out_list` 一到 `ATTENTION_UPDATE_MAX_INPUTS` 就先 `merge_prefill_chunks` 压成一对，1653 行注释写「CANN npu_attention_update accepts at most 16 output/LSE pairs」。
 
 结论：CUDA 的 tile 是源码里能改的数；NPU 的 tile 形状封在 CANN 二进制里，仓库只能控制 page 粒度、mask 模式和 workspace 尺寸，对不齐时靠 pad（头数补 2 的幂、序列补 16）绕过，而不是调 tile。
@@ -72,7 +72,7 @@ NPU 侧同一件事只剩三个**整数枚举型**旋钮，没有 tile 形状：
 
 - KV 写入 + RMSNorm + RoPE（+ 可选 fp8 descale）融成一个 op：`vllm-project/vllm-ascend/vllm_ascend/attention/mla_v1.py:1844-1857` 的 `npu_kv_rmsnorm_rope_cache(kv_no_split, self.kv_a_layernorm.weight, cos, sin, slots.to(torch.int64), ...)`，`cache_mode = "PA_NZ" if self.enable_kv_nz else "PA"`（1842 行）。一个调用同时吃未归一化的 KV、gamma、cos/sin、slot 和 cache。
 - MLA 整条预处理链融成一个 op：`vllm-project/vllm-ascend/vllm_ascend/attention/mla_v1.py:2353-2363` 的 `npu_mla_prolog_v3(token_x, weight_dq, weight_uq_qr, weight_uk, weight_dkv_kr, rmsnorm_gamma_cq, rmsnorm_gamma_ckv, ...)`。q_a/kv_a 投影、两处 RMSNorm、RoPE、写 cache 全在一个 op 内，权重以参数形式传入，中间张量不出 op 边界。
-- attention 本体：`vllm-project/vllm-ascend/vllm_ascend/attention/mla_v1.py:1728-1730` 与 `vllm-project/vllm-ascend/vllm_ascend/attention/attention_v1.py:736`、`959` 的 `npu_fused_infer_attention_score`；decoder 的 page 版是 `_npu_paged_attention`（`vllm-project/vllm-ascend/vllm_ascend/attention/attention_v1.py:831`）。
+- attention 本体：`vllm-project/vllm-ascend/vllm_ascend/attention/mla_v1.py:1728-1730` 与 `vllm-project/vllm-ascend/vllm_ascend/attention/attention_v1.py:726`、`979` 的 `npu_fused_infer_attention_score`；decoder 的 page 版是 `_npu_paged_attention`（`vllm-project/vllm-ascend/vllm_ascend/attention/attention_v1.py:1148`）。
 - KV cache 的 NZ 写：`vllm-project/vllm-ascend/vllm_ascend/attention/attention_v1.py:1816-1827` 的 `npu_scatter_pa_kv_cache(key=..., value=..., key_cache=k_cache_layer, ...)`，1816 行注释写「NZ write path: 5D view + npu_scatter_pa_kv_cache」。
 - RoPE 交织：`vllm-project/vllm-ascend/vllm_ascend/attention/mla_v1.py:2736` 的 `npu_interleave_rope(x, cos, sin)`。
 - 量化：`vllm-project/vllm-ascend/vllm_ascend/attention/mla_v1.py:2315` 的 `npu_dynamic_quant(token_x)`、`2323` 的 `npu_dynamic_mx_quant(token_x, dst_type=torch.float8_e4m3fn)`，decode 侧另有 `3082`、`3220`。
