@@ -210,6 +210,52 @@ def test_fused_mlp_rejects_bad_shapes_real_and_fake(shapes, needle):
             fused_mlp(fa, fw, fb)
 
 
+def test_fused_mlp_rejects_symbolic_k_not_multiple_of_bk():
+    """符号形状下 K 不整除 BK 必须在**编译期**就被拒，而不是放过 export、运行期才炸。
+
+    复现路径：``torch.export`` 用 ``Dim("K")`` 把内维标成符号维，喂 K=10
+    （不是 16 的整数倍）。修复前 export 成功、真跑才算错——正是「编译期过、
+    运行期炸」；修复后 fake 实现用 ``torch._check`` 把约束写进图，export 当场失败。
+    """
+    from gkern.torch_ext.custom_ops import fused_mlp
+
+    class M(torch.nn.Module):
+        def forward(self, a, w, b):
+            return fused_mlp(a, w, b)
+
+    a = torch.randn(4, 10)
+    w = torch.randn(10, 8)
+    b = torch.randn(8)
+    dim_k = torch.export.Dim("K")
+    with pytest.raises(Exception, match="整数倍|BK"):
+        torch.export.export(
+            M(), (a, w, b),
+            dynamic_shapes=({1: dim_k}, {0: dim_k}, None),
+        )
+
+
+def test_fused_mlp_accepts_symbolic_k_multiple_of_bk():
+    """把符号维约束成 16 的整数倍（``16*_K``）后必须能 export 成功。
+
+    证明上面那条拒绝不是无差别乱拒：约束可被求解器证明满足时放行。
+    """
+    from gkern.torch_ext.custom_ops import fused_mlp
+
+    class M(torch.nn.Module):
+        def forward(self, a, w, b):
+            return fused_mlp(a, w, b)
+
+    a = torch.randn(4, 32)
+    w = torch.randn(32, 8)
+    b = torch.randn(8)
+    _K = torch.export.Dim("_K")
+    ep = torch.export.export(
+        M(), (a, w, b),
+        dynamic_shapes=({1: 16 * _K}, {0: 16 * _K}, None),
+    )
+    assert ep is not None
+
+
 def test_fused_mlp_fake_valid_shape_reports_correct_output_shape():
     from gkern.torch_ext.custom_ops import fused_mlp
     with FakeTensorMode():
@@ -292,11 +338,10 @@ def test_explain_without_argument_reports_latest_compile():
 
 
 def test_explain_latest_is_recent_compile_not_first_inserted_key():
-    """回归：``torch._dynamo.reset()`` 之后 CompileId 会从 ``0/0`` 重新分配。
+    """同一函数先融合再因 dtype 变化回退，查询必须回答最近一次编译。
 
-    重编译同一个帧是**原地覆盖**旧 key，所以 dict 的插入位置仍停在最前面；
-    若把「最新」实现成「插入顺序里的最后一个」，就会一直回答第一次编译的
-    结论。这里先融合再回退，正确答案是回退。
+    Dynamo 的 cache entry 顺序不能当作编译时间顺序；reset 后 CompileId
+    还会复用，原地覆盖的 dict key 也必须算作最近一次记录。
     """
     from gkern.torch_ext.backend import REPORTS, explain, gkern_backend
     torch._dynamo.reset()
@@ -306,8 +351,27 @@ def test_explain_latest_is_recent_compile_not_first_inserted_key():
     cf(torch.randn(31))                            # float32 → 融合
     assert explain()["fused"] is True
     cf(torch.randn(31, dtype=torch.float64))       # dtype 变 → 重编译 → 回退
-    assert list(REPORTS) == ["0/0", "0/1"], list(REPORTS)
     assert explain()["fused"] is False
     assert "float32" in explain()["reason"]
     assert explain(cf)["fused"] is False
     assert "float32" in explain(cf)["reason"]
+
+
+def test_explain_latest_is_recency_not_dict_insertion_order():
+    """reset 后重编译旧帧会覆盖 key，插入顺序不再等于编译顺序。"""
+    from gkern.torch_ext.backend import REPORTS, explain, gkern_backend
+    torch._dynamo.reset()
+    REPORTS.clear()
+    fused_fn = lambda x: torch.sigmoid(x) * 2.0
+    fallback_fn = lambda x, y: torch.sin(x) + y
+    cf = torch.compile(fused_fn, backend=gkern_backend, fullgraph=True, dynamic=False)
+    cb = torch.compile(fallback_fn, backend=gkern_backend, fullgraph=True, dynamic=False)
+    cf(torch.randn(31))
+    cb(torch.randn(31), torch.randn(31))
+    assert explain()["fused"] is False
+    assert "sin" in explain()["reason"]
+
+    torch._dynamo.reset()
+    cf(torch.randn(41))                            # 重编译旧帧 → 原地覆盖旧 key
+    assert explain()["fused"] is True
+    assert explain(cf)["fused"] is True

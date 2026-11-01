@@ -7,7 +7,7 @@
 
 | JD 要求 | 本仓库证据（可运行） | status |
 |---|---|---|
-| 熟悉 Linux 开发环境 | 全部开发与 89 个测试在 Linux/CPU 上跑通；`benchmarks/run_benchmarks.py` 产出机器可读 JSON | 覆盖 |
+| 熟悉 Linux 开发环境 | 全部开发与 92 个测试在 Linux/CPU 上跑通；`benchmarks/run_benchmarks.py` 产出机器可读 JSON | 覆盖 |
 | 掌握 C++ / Python | Python 全覆盖（`src/gkern/**`）；**C++ 无代码** | 部分 |
 | 熟悉 CUDA 编程模型及 GPU 执行与内存体系 | `gpgpu/warp.py` 掩码与分支发散、`gpgpu/memory.py` 128B 事务计数与 32 bank 冲突、`gpgpu/device.py` SM/寄存器/占用率、`compiler/costmodel.py` roofline 受限判断 | 覆盖（**概念与计数层**，非 CUDA 源码） |
 | 熟悉至少一种主流 AI 框架 | PyTorch：`torch.library` 自定义算子（实现/fake/autograd/schema）`+ torch.compile` 自定义后端 `+ FX` 图下沉；Triton 到源码级阅读（见 `docs/ecosystem.md` A 节） | 覆盖 |

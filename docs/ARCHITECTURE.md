@@ -95,7 +95,8 @@ torch.compile 自定义后端 (backend.py + fx_lower.py)  ← 最激进：整图
 只能算 float32，所以 `register_fake` 也**必须**拒绝非 float32——否则 fake 放行
 float64、运行期悄悄降精度，正是 `torch.compile` 最典型的 dtype 事故。
 `fused_mlp` 的 `K % BK == 0`（IR 无循环，K 是编译期常量）与形状约束在 real/fake
-两端共用同一份校验，不允许「编译期过、运行期炸」。
+两端共用同一份校验。符号维度通过 `torch._check` 记录约束；导出时将 K 声明为
+`16 * torch.export.Dim("tiles")`，使导出器可以证明它满足分块要求。
 
 「静默给错结果」比「明确回退」危险得多，所以这里宁可回退得多。
 

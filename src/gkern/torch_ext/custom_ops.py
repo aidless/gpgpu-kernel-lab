@@ -47,10 +47,25 @@ def _known_int(dim) -> "int | None":
     """把维度转成 int；符号维度（SymInt）返回 None。
 
     动态形状下维度可能是 SymInt，对它做 ``%``/``==`` 会生成 SymBool，
-    在 ``if`` 里会抛 data-dependent guard 错误 —— 所以符号维度上不做判断，
-    留给运行期（真实实现）自己报错。
+    在 Python ``if`` 里会抛 data-dependent guard 错误 —— 所以具体维度用
+    普通比较，符号维度改用 :func:`torch._check`（见 ``_check_fused_mlp``）。
     """
     return dim if isinstance(dim, int) else None
+
+
+def _require(op: str, cond, message: str) -> None:
+    """对具体 bool 直接抛，对符号 SymBool 用 ``torch._check`` 落成图内断言。
+
+    ``cond`` 是 Python ``bool`` 时走普通分支（真实实现、具体形状走的都是这条）；
+    是 ``SymBool`` 时 ``torch._check`` 会把断言写进图里，于是 ``torch.export`` /
+    ``torch.compile`` 在**编译期**就会因为不满足的符号约束而失败，而不是放过
+    一个真实 kernel 算不了的形状、等到运行期才炸。
+    """
+    if isinstance(cond, bool):
+        if not cond:
+            raise RuntimeError(message)
+    else:
+        torch._check(cond, lambda: message)
 
 
 def _check_fused_mlp(op: str, a: torch.Tensor, w: torch.Tensor,
@@ -68,23 +83,22 @@ def _check_fused_mlp(op: str, a: torch.Tensor, w: torch.Tensor,
     k = a.shape[1]
     k2 = w.shape[0]
     n = w.shape[1]
-    if _known_int(k) is not None and _known_int(k2) is not None and k != k2:
-        raise RuntimeError(
-            f"{op} 权重形状不匹配：A{tuple(a.shape)} @ W{tuple(w.shape)}"
-            f"（内维 {k} != {k2}）")
+    _require(op,
+             k == k2,
+             f"{op} 权重形状不匹配：A{tuple(a.shape)} @ W{tuple(w.shape)}"
+             f"（内维 {k} != {k2}）")
 
     if bias.dim() != 1:
         raise RuntimeError(
             f"{op} 偏置 bias 形状必须为 ({n},)，收到 {tuple(bias.shape)}")
     b_len = bias.shape[0]
-    if _known_int(b_len) is not None and _known_int(n) is not None and b_len != n:
-        raise RuntimeError(
-            f"{op} 偏置 bias 形状必须为 ({n},)，收到 {tuple(bias.shape)}")
+    _require(op,
+             b_len == n,
+             f"{op} 偏置 bias 形状必须为 ({n},)，收到 {tuple(bias.shape)}")
 
-    kk = _known_int(k)
-    if kk is not None and kk % _BK != 0:
-        raise RuntimeError(
-            f"{op} 的 K={kk} 必须是 BK={_BK} 的整数倍（IR 无循环，K 为编译期常量）")
+    _require(op,
+             k % _BK == 0,
+             f"{op} 的 K={k} 必须是 BK={_BK} 的整数倍（IR 无循环，K 为编译期常量）")
 
 
 def _gelu_tanh(x: torch.Tensor) -> torch.Tensor:

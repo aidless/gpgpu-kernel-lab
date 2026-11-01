@@ -39,7 +39,7 @@
 ```bash
 cd gpgpu-kernel-lab
 pip install -e ".[dev]"          # numpy + torch + pytest
-pytest                            # 89 个测试，约 11 秒
+pytest                            # 92 个测试，约 11 秒
 PYTHONPATH=src python3 examples/quickstart.py
 PYTHONPATH=src python3 benchmarks/run_benchmarks.py
 ```
@@ -162,7 +162,7 @@ src/gkern/
 ## 测试与自检闸
 
 ```bash
-pytest                                    # 89 passed
+pytest                                    # 92 passed
 PYTHONPATH=src python3 scripts/verify_numbers.py            # 重算文档里每个数字
 PYTHONPATH=src python3 scripts/verify_numbers.py --selftest # 证明这个闸会红
 ```
