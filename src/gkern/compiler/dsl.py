@@ -51,6 +51,25 @@ class Ptr:
         self.dtype = np.dtype(dtype)
 
 
+class SmemRef:
+    """一块共享内存（每个 block 一份，整张 grid 共用同一个分配描述）。"""
+
+    def __init__(self, name: str, shape: Sequence[int], dtype: Any = np.float32) -> None:
+        self.name = name
+        self.shape = tuple(int(s) for s in shape)
+        self.dtype = np.dtype(dtype)
+
+    @property
+    def numel(self) -> int:
+        n = 1
+        for d in self.shape:
+            n *= int(d)
+        return n
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试用
+        return f"SmemRef({self.name}, shape={self.shape}, {self.dtype.name})"
+
+
 # ---------------------------------------------------------------------------
 # 追踪上下文
 # ---------------------------------------------------------------------------
@@ -79,6 +98,22 @@ class _Tracer:
     def store(self, ptr: Ptr, offsets: Tile, value: Tile,
               mask: Optional[Tile] = None) -> None:
         self.program.emit_store(ptr.name, offsets, value, mask)
+
+    # ---- 共享内存 -------------------------------------------------------
+    def smem_alloc(self, name: str, shape: Sequence[int],
+                   dtype: Any = np.float32) -> SmemRef:
+        self.program.alloc_smem(name, shape, dtype)
+        return SmemRef(name, shape, dtype)
+
+    def smem_store(self, ref: SmemRef, offsets: Tile, value: Tile,
+                   mask: Optional[Tile] = None) -> None:
+        self.program.emit_smem_store(ref.name, offsets, value, mask)
+
+    def smem_load(self, ref: SmemRef, offsets: Tile,
+                  mask: Optional[Tile] = None) -> Tile:
+        args = [offsets.id] + ([mask.id] if mask is not None else [])
+        return self.program.emit("smem_load", offsets.shape, ref.dtype, args,
+                                 smem=ref.name)
 
     # ---- 逐元素 ---------------------------------------------------------
     def const(self, value: Any, dtype: Any = None) -> Tile:
@@ -296,6 +331,19 @@ def load(ptr: Ptr, offsets: Tile, mask: Optional[Tile] = None, other: float = 0.
 
 def store(ptr: Ptr, offsets: Tile, value: Tile, mask: Optional[Tile] = None) -> None:
     _t().store(ptr, offsets, value, mask)
+
+
+def smem_alloc(name: str, shape: Sequence[int], dtype: Any = np.float32) -> SmemRef:
+    return _t().smem_alloc(name, shape, dtype)
+
+
+def smem_store(ref: SmemRef, offsets: Tile, value: Tile,
+               mask: Optional[Tile] = None) -> None:
+    _t().smem_store(ref, offsets, value, mask)
+
+
+def smem_load(ref: SmemRef, offsets: Tile, mask: Optional[Tile] = None) -> Tile:
+    return _t().smem_load(ref, offsets, mask)
 
 
 def exp(x: Tile) -> Tile:

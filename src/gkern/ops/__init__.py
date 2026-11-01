@@ -13,13 +13,18 @@ import numpy as np
 
 from ..compiler import codegen, compile_kernel, costmodel
 from ..compiler import dsl as tl
-from . import elementwise, matmul, softmax
+from . import elementwise, matmul, smem, softmax
 
 __all__ = [
     "elementwise", "softmax", "matmul",
     "run_vector_add", "run_scale_gelu", "run_softmax", "run_layernorm",
-    "run_matmul", "run_fused_mlp", "OpResult",
+    "run_matmul", "run_fused_mlp", "run_smem_column", "OpResult",
 ]
+
+
+def run_smem_column(pitch: int = 32, block: int = 32) -> "smem.SmemColumnResult":
+    """共享内存按列读的 bank 冲突实验（见 :mod:`gkern.ops.smem`）。"""
+    return smem.run_smem_column(pitch=pitch, block=block)
 
 
 @dataclass
@@ -114,7 +119,7 @@ def run_layernorm(x: np.ndarray, w: np.ndarray, b: np.ndarray,
 
 
 def run_matmul(a: np.ndarray, b: np.ndarray, bm: int = 32, bn: int = 32,
-               bk: int = 16) -> OpResult:
+               bk: int = 16, use_smem: bool = False, pad: int = 0) -> OpResult:
     a = np.ascontiguousarray(a, dtype=np.float32)
     b = np.ascontiguousarray(b, dtype=np.float32)
     m, k = _require_2d("matmul 的 A", a)
@@ -126,8 +131,12 @@ def run_matmul(a: np.ndarray, b: np.ndarray, bm: int = 32, bn: int = 32,
     out = np.zeros((m, n), dtype=np.float32)
     grid = (_cdiv(m, bm), _cdiv(n, bn))
     bufs = {"A": a, "B": b, "C": out}
-    prog = compile_kernel(matmul.matmul_tiled, bufs, {"M": m, "N": n},
-                          {"BM": bm, "BN": bn, "BK": bk, "K": k}, grid)
+    if use_smem:
+        prog = compile_kernel(matmul.matmul_smem, bufs, {"M": m, "N": n},
+                              {"BM": bm, "BN": bn, "BK": bk, "K": k, "PAD": pad}, grid)
+    else:
+        prog = compile_kernel(matmul.matmul_tiled, bufs, {"M": m, "N": n},
+                              {"BM": bm, "BN": bn, "BK": bk, "K": k}, grid)
     codegen.run(prog, bufs)
     return OpResult(out, prog, costmodel.analyze(prog))
 

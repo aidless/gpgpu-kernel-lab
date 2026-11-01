@@ -42,6 +42,23 @@ jobs:
         run: python benchmarks/run_benchmarks.py
         env:
           PYTHONPATH: src
+      - name: Re-derive the cloud reconciliation from committed evidence
+        run: python benchmarks/analyze_triton.py
+        env:
+          PYTHONPATH: src
+      - name: Assert smem byte equality and warp-level bank conflicts
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          data = json.loads(pathlib.Path("benchmarks/results/bench.json").read_text())
+          assert all(r["bytes_equal"] for r in data["smem"]), data["smem"]
+          assert all(r["close"] for r in data["smem"]), data["smem"]
+          bank = {r["pitch"]: r["conflicts"] for r in data["bank"]}
+          assert bank[32] == 992 and bank[33] == 0, bank
+          reuse = {r["n"]: r["reuse_bound"] for r in data["reuse"]}
+          assert reuse[2048] == "compute", reuse
+          print("smem 字节相等 / bank 992-0 / 复用上界 n=2048 compute 均通过")
+          PY
       - name: Assert the fusion byte equality still holds
         run: |
           python - <<'PY'

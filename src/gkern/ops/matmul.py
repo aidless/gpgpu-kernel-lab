@@ -52,6 +52,52 @@ def matmul_tiled(A, B, C, M, N, BM: constexpr, BN: constexpr, BK: constexpr,
 
 
 @jit
+def matmul_smem(A, B, C, M, N, BM: constexpr, BN: constexpr, BK: constexpr,
+                K: constexpr, PAD: constexpr = 0):
+    """和 :func:`matmul_tiled` 做同样的事，但 A/B 面板先落共享内存。
+
+    这次改动**不减少** HBM 流量（每个 block 仍要把自己的 A/B 面板从全局读一遍），
+    它改变的是三件别的事：
+
+    - 面板进片上内存后，乘加从共享内存取数，不再反复走 global → L1 的路；
+    - ``PAD`` 给行宽加 padding，避开按列访问时的 bank 冲突；
+    - 共享内存容量（48 KiB/block）因此成为分块尺寸的真实约束。
+
+    「加了 smem 就该变成 compute bound」是常见误解：``tests/test_smem.py``
+    第一条断言就是把这件事钉住——两者的全局字节数必须**完全相等**。
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    stride_a = BK + PAD
+    stride_b = BN + PAD
+    a_smem = tl.smem_alloc("a_panel", (BM, stride_a))
+    b_smem = tl.smem_alloc("b_panel", (BK, stride_b))
+
+    bi = tl.expand_dims(tl.arange(0, BM), 1)          # (BM,1)
+    bj = tl.expand_dims(tl.arange(0, BK), 0)          # (1,BK)
+    a_idx = bi * stride_a + bj                        # (BM,BK)
+    ki = tl.expand_dims(tl.arange(0, BK), 1)          # (BK,1)
+    nj = tl.expand_dims(tl.arange(0, BN), 0)          # (1,BN)
+    b_idx = ki * stride_b + nj                        # (BK,BN)
+
+    rows2 = tl.expand_dims(pid_m * BM + tl.arange(0, BM), 1)   # (BM,1)
+    cols2 = tl.expand_dims(pid_n * BN + tl.arange(0, BN), 0)   # (1,BN)
+
+    acc = tl.zeros((BM, BN))
+    for k0 in range(0, K, BK):
+        kk = k0 + tl.arange(0, BK)
+        kk_r = tl.expand_dims(kk, 0)                  # (1,BK)
+        kk_c = tl.expand_dims(kk, 1)                  # (BK,1)
+        a = tl.load(A, rows2 * K + kk_r, (rows2 < M) & (kk_r < K))
+        b = tl.load(B, kk_c * N + cols2, (kk_c < K) & (cols2 < N))
+        tl.smem_store(a_smem, a_idx, a)
+        tl.smem_store(b_smem, b_idx, b)
+        acc = tl.dot(tl.smem_load(a_smem, a_idx), tl.smem_load(b_smem, b_idx)) + acc
+
+    tl.store(C, rows2 * N + cols2, acc, (rows2 < M) & (cols2 < N))
+
+
+@jit
 def bias_gelu_epilogue(C, BIAS, OUT, M, N, BM: constexpr, BN: constexpr):
     """在 matmul 的同一套 2D tile 网格上做 ``gelu(c + bias)``。
 

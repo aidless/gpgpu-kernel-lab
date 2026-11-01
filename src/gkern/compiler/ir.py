@@ -115,6 +115,22 @@ class StoreInstr:
     order: int = 0
 
 
+@dataclass(frozen=True)
+class SmemStoreInstr:
+    """写共享内存。和 :class:`StoreInstr` 分开，是为了让代价模型不会把它算成 HBM 流量。
+
+    这是本仓库最重要的一条区分：**共享内存写不是全局内存写**。
+    如果两者共用一个指令类型，`costmodel.analyze()` 会把 smem 分块版算成
+    「多了几倍访存」，结论会完全反过来。
+    """
+
+    smem: str
+    offsets: int
+    value: int
+    mask: Optional[int] = None
+    order: int = 0
+
+
 @dataclass
 class Program:
     """一个 block 级程序：一次 grid 发射里每个 block 执行的指令序列。"""
@@ -124,6 +140,7 @@ class Program:
     inputs: Dict[str, Tuple[Tuple[int, ...], np.dtype]] = field(default_factory=dict)
     outputs: list[str] = field(default_factory=list)
     constexprs: Dict[str, Any] = field(default_factory=dict)
+    smem: Dict[str, Tuple[Tuple[int, ...], np.dtype]] = field(default_factory=dict)
     grid: Tuple[int, ...] = (1,)
     num_warps: int = 4
 
@@ -151,13 +168,31 @@ class Program:
             self.outputs.append(buffer)
         return ins
 
+    def emit_smem_store(self, smem: str, offsets: Tile, value: Tile,
+                        mask: Optional[Tile] = None) -> SmemStoreInstr:
+        """写共享内存：产生副作用，但**不**进 ``outputs``、**不**算 HBM 流量。"""
+        if smem not in self.smem:
+            raise KeyError(f"共享内存 {smem} 没有分配过")
+        ins = SmemStoreInstr(smem=smem, offsets=offsets.id, value=value.id,
+                             mask=None if mask is None else mask.id,
+                             order=len(self.instrs))
+        self.instrs.append(ins)
+        return ins
+
+    def alloc_smem(self, name: str, shape: Sequence[int],
+                   dtype: Any = np.float32) -> Tuple[Tuple[int, ...], np.dtype]:
+        if name in self.smem:
+            raise ValueError(f"共享内存 {name} 重复分配")
+        spec = (tuple(int(s) for s in shape), np.dtype(dtype))
+        self.smem[name] = spec
+        return spec
+
     # ---- 查询 -----------------------------------------------------------
     def tile(self, tid: int) -> Tile:
         node = self.instrs[tid]
         if not isinstance(node, Tile):
             raise TypeError(f"#{tid} 不是值节点：{type(node).__name__}")
         return node
-
     def stores(self) -> list[StoreInstr]:
         return [n for n in self.instrs if isinstance(n, StoreInstr)]
 
@@ -171,6 +206,7 @@ class Program:
             inputs=dict(self.inputs),
             outputs=list(self.outputs),
             constexprs=dict(self.constexprs),
+            smem=dict(self.smem),
             grid=self.grid,
             num_warps=self.num_warps,
         )
@@ -179,6 +215,11 @@ class Program:
                 p.instrs.append(
                     Tile(id=node.id, op=node.op, shape=node.shape, dtype=node.dtype,
                          args=node.args, attrs=dict(node.attrs))
+                )
+            elif isinstance(node, SmemStoreInstr):
+                p.instrs.append(
+                    SmemStoreInstr(smem=node.smem, offsets=node.offsets,
+                                   value=node.value, mask=node.mask, order=node.order)
                 )
             else:
                 p.instrs.append(

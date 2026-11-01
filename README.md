@@ -42,7 +42,7 @@
 ```bash
 cd gpgpu-kernel-lab
 pip install -e ".[dev]"          # numpy + torch + pytest
-pytest                            # 92 个测试，约 11 秒
+pytest                            # 104 个测试，约 24 秒
 PYTHONPATH=src python3 examples/quickstart.py
 PYTHONPATH=src python3 benchmarks/run_benchmarks.py
 ```
@@ -121,7 +121,93 @@ src/gkern/
 
 ---
 
-## 开发中实际踩到并修掉的八个坑
+**共享内存分块：省的不是 HBM 流量**
+
+`A(256,256) @ B(256,256)`，tile=32 / 64，两个版本各自跑一遍：
+
+| tile | 未用 smem 访存 (B) | 用 smem 访存 (B) | 字节相等 | 数值一致 |
+|---|---:|---:|---|---|
+| 32 | 4456448 | 4456448 | True | True |
+| 64 | 2359296 | 2359296 | True | True |
+
+**字节数完全相等**——这是整个仓库里最容易被讲错的一条。共享内存省的是
+global → L1 的往返与 bank 冲突，不是 HBM 流量：每个 block 仍然要把自己的 A/B
+面板从全局读一遍。所以「加了 smem 就该变成 compute bound」是错的，
+`tests/test_smem.py::test_smem_tiling_does_not_change_global_bytes` 就是钉这件事的。
+
+**真正决定 memory/compute 的是复用与规模**
+
+| 方阵 n | 逐块重读下界 (B) | 下界 AI | 下界受限 | 理想复用上界 (B) | 上界 AI | 上界受限 |
+|---|---:|---:|---|---:|---:|---|
+| 512 | 17825792 | 15.53 | memory | 3145728 | 88.0 | memory |
+| 1024 | 138412032 | 16.00 | memory | 12582912 | 176.0 | memory |
+| 2048 | 1090519040 | 16.25 | memory | 50331648 | 352.0 | compute |
+
+理想复用（每个输入只从 HBM 读一次）下方阵 GEMM 的 `AI = N/6`，
+交叉点 256 FLOP/B 需要 **N ≥ 1536**——而把 tile 从 16 加到 128，
+AI 只从 4.27 涨到 29.59，离交叉点差一个数量级。**调 tile 翻不动 bound，
+是这里的算术决定的，不是调参不够努力。**
+
+**bank 冲突：同一个算子，行宽差 1 个 float**
+
+| 共享内存行宽 (float) | 访问次数 | bank 冲突轮次 | 冲突率 |
+|---|---:|---:|---:|
+| 32 | 1056 | 992 | 0.9394 |
+| 33 | 1056 | 0 | 0.0 |
+
+按列读行主序面板时，行宽 32 让 32 个 lane 全落 bank 0；行宽改成 33 全部散开。
+
+---
+
+**PrivateUse1 设备后端：`torch.device("gkern")` 能建出来，算子还跑不了**
+
+```python
+from gkern.torch_ext import register_device_backend
+register_device_backend("gkern")        # 改名 + 注册设备模块 + 生成 .gkern() 方法
+torch.device("gkern", 0)                # gkern:0  ← 合法
+torch.gkern.device_count()              # 1
+torch.empty(4, device="gkern")          # NotImplementedError ← 刻意的
+```
+
+最后一行不是 bug，是这一层的**边界**：PrivateUse1 的内存分配只能在 C++ 注册
+（`c10::PrivateUse1Allocator` + `TORCH_LIBRARY_IMPL(aten, PrivateUse1, m)`），
+纯 Python 接管不了 `aten::empty` 的 dispatch。缺口清单在
+`device_backend.GAPS` 里（分配器 / 算子内核 / stream-event / 设备侧 autograd / 显存统计），
+`describe()` 输出「接了哪几层」。测试把这条失败钉成断言——宁可它红，
+也不要一个「数值对、设备掺假」的假成功。
+
+顺带纠一个常见混用：`torch.compile(backend="gkern")` 与 PrivateUse1 设备后端
+**不是一件事**——前者只接管图的分段与执行，张量仍在 CPU 上；后者要求张量真的
+具有第三种设备类型、dispatch key 切到 PrivateUse1。见 `docs/ecosystem.md` E.1 的对照表。
+
+---
+
+**云端实测：T4 上量一次，再回头问模型准不准**
+
+本仓库其他数字都是 CPU 上可复算的机制演示；唯独这一节是**真实 GPU 实测**，
+两者混用就是自欺，所以证据、脚本、对账三者分开写：
+
+| 项 | 值 |
+|---|---|
+| 平台 | Kaggle 私有 kernel，Tesla T4（40 SM） |
+| 环境 | torch 2.11.0+cu128、triton 3.6.0、Python 3.13.15 |
+| 采集 | `benchmarks/triton/bench_softmax_triton.py`（`do_bench` warmup=25/rep=100） |
+| 证据 | `benchmarks/results/triton_softmax_t4.json`（带 provenance） |
+| 对账 | `benchmarks/analyze_triton.py --write-report` → `docs/cloud-reconciliation.md` |
+
+三条结论（每条都在对账文档里带表）：
+
+1. **模型是严格下界**：实测/预测 = 1.36～1.40，即 71%～74% 的理论带宽；
+   五档 shape 的受限类型判得全对（都是 `memory`），但别把 `predicted_ms` 当成能跑到的时间。
+2. **小 shape 掉到 49%**：cols=512 时占用率不足，模型的问题定义里就没有这一项。
+3. **手写 Triton fused softmax 没稳定赢过 `torch.softmax`**（cols=512 慢 26%，
+   1024/2048 快约 1.08～1.10×，4096/8192 反而慢 3%～5%）。CPU 侧的字节账
+   「融合省掉中间张量」是真的，但它推不出「手写 kernel 更快」——
+   eager 行 softmax 本身已是单遍带宽受限实现。
+
+---
+
+## 开发中实际踩到并修掉的十个坑
 
 每一条都是**先有失败的症状、再定位根因**，不是事后编的故事：
 
@@ -159,13 +245,23 @@ src/gkern/
    `TypeError`，Dynamo 侧接不住）、`explain(obj)` 无视参数直接回 `REPORTS` 第一条
    （问 A 答 B）。修法：real/fake 共用同一份校验、`try_lower` 先拒非 CPU 与符号形状、
    `REPORTS` 改按 Dynamo 的 `CompileId` 归档。
+9. **bank 冲突按整块 tile 算，得出了一个不存在的结论**（`gpgpu/memory.py`）。给
+   `SharedMemory` 加共享内存分块后，一次**无冲突**的整块写被算成 31 倍冲突：
+   因为 `bank_conflict_degree` 把 1024 个元素当成「一次访问」一起求最大 bank 命中数，
+   得出「1024 次访问撞在 32 个 bank 上」。硬件真正一起发射的单位是 **warp**，
+   所以必须按 32 个 lane 分组。修法：新增 `warp_bank_conflicts()`，按 warp 切块求和
+   （实测行宽 32 从「32736 轮冲突」纠正为 992，行宽 33 从 31744 纠正为 0）。
+10. **整数地址算术被当成 FLOP，把算术强度抬高了 4.8%**（`compiler/costmodel.py`）。
+   `analyze()` 原来对 `add/mul` 一律按 numel 计浮点，于是 GEMM 里的偏移量计算
+   （`rm2 * K + rk_r`，int64）也被算成浮点运算：n=1024 的算术强度从 176.0 虚高到
+   184.5，roofline 判定跟着漂。修法：只对浮点 dtype 的节点计 FLOP。
 
 ---
 
 ## 测试与自检闸
 
 ```bash
-pytest                                    # 92 passed
+pytest                                    # 104 passed
 PYTHONPATH=src python3 scripts/verify_numbers.py            # 重算文档里每个数字
 PYTHONPATH=src python3 scripts/verify_numbers.py --selftest # 证明这个闸会红
 ```
@@ -185,6 +281,8 @@ README/文档里出现的每个数值（26.2144 TFLOPS、102.4 GB/s、64/2048 �
   每一种不支持语义的回退都必须给出原因；另有**编译期与运行期语义一致性**的一组：
   非 float32 在 real/fake 两端都拒绝、`fused_mlp` 的 `K % 16` 与形状约束两边都校验、
   非 CPU 张量与符号维度在 `try_lower` 就干净回退、`explain(obj)` 只回答**该对象**的结论。
+- `tests/test_smem.py`：共享内存分块的**反直觉不变量**（字节数必须与 global-only 完全相等）、
+  bank 冲突按 warp 分组的 992/0 两档、复用上界只在 n≥1536 才翻成 compute。
 - `tests/test_package.py`：公开 API 契约（`from gkern.torch_ext import register_backend`
   必须真的可用——这个包曾一度缺 `__init__.py`，`import gkern` 正常但公开名字导入失败）。
 
@@ -198,8 +296,10 @@ README/文档里出现的每个数值（26.2144 TFLOPS、102.4 GB/s、64/2048 �
 - [x] 算子融合（省访存等式可复算）与分块 autotune
 - [x] `torch.library` 自定义算子（前向 / fake / autograd / schema）
 - [x] `torch.compile(backend="gkern")` 自定义后端（含回退原因）
-- [ ] 共享内存分块 GEMM（把 matmul 的算术强度真正推到计算受限区）
-- [ ] `PrivateUse1` 设备后端骨架（`torch.device("gkern")`）
+- [x] 共享内存分块 GEMM + 复用上界模型（`reuse_bound`：理想 L2 复用下 `AI = N/6 + N/192`，
+      n=2048 首次判为 compute；同时证明 smem 本身不改 HBM 字节）
+- [x] `PrivateUse1` 设备后端骨架（设备对象与查询函数接上，分配器 / kernel 缺口清单化）
+- [x] 云端 GPU 实测 + 代价模型对账（T4：`docs/cloud-reconciliation.md`）
 - [ ] 真实国产卡上的算子对拍（等算力到位后，把「模拟」换成「实测」）
 
 ## 延伸阅读

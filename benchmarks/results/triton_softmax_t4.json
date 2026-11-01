@@ -1,0 +1,83 @@
+{
+  "meta": {
+    "gpu_name": "Tesla T4",
+    "gpu_total_memory_gb": 14.56,
+    "sm_count": 40,
+    "torch_version": "2.11.0+cu128",
+    "triton_version": "3.6.0",
+    "cuda_version": "12.8",
+    "python": "3.13.15",
+    "platform": "Linux-6.18.55+-x86_64-with-glibc2.39"
+  },
+  "rows": [
+    {
+      "rows": 4096,
+      "cols": 512,
+      "block_size": 512,
+      "bytes_read_write": 16777216,
+      "triton_ms": 0.10603,
+      "triton_gbps": 158.23,
+      "eager_ms": 0.07856,
+      "eager_gbps": 213.56,
+      "speedup_vs_eager": 0.741,
+      "max_abs_diff": 1.4901161193847656e-08
+    },
+    {
+      "rows": 4096,
+      "cols": 1024,
+      "block_size": 1024,
+      "bytes_read_write": 33554432,
+      "triton_ms": 0.14212,
+      "triton_gbps": 236.11,
+      "eager_ms": 0.15622,
+      "eager_gbps": 214.8,
+      "speedup_vs_eager": 1.099,
+      "max_abs_diff": 1.1175870895385742e-08
+    },
+    {
+      "rows": 4096,
+      "cols": 2048,
+      "block_size": 2048,
+      "bytes_read_write": 67108864,
+      "triton_ms": 0.2926,
+      "triton_gbps": 229.35,
+      "eager_ms": 0.31683,
+      "eager_gbps": 211.81,
+      "speedup_vs_eager": 1.083,
+      "max_abs_diff": 5.587935447692871e-09
+    },
+    {
+      "rows": 4096,
+      "cols": 4096,
+      "block_size": 4096,
+      "bytes_read_write": 134217728,
+      "triton_ms": 0.58654,
+      "triton_gbps": 228.83,
+      "eager_ms": 0.55779,
+      "eager_gbps": 240.62,
+      "speedup_vs_eager": 0.951,
+      "max_abs_diff": 3.725290298461914e-09
+    },
+    {
+      "rows": 4096,
+      "cols": 8192,
+      "block_size": 8192,
+      "bytes_read_write": 268435456,
+      "triton_ms": 1.17603,
+      "triton_gbps": 228.26,
+      "eager_ms": 1.13988,
+      "eager_gbps": 235.49,
+      "speedup_vs_eager": 0.969,
+      "max_abs_diff": 1.862645149230957e-09
+    }
+  ],
+  "provenance": {
+    "measured_on": "2026-10-31 (America/Los_Angeles)",
+    "platform": "Kaggle Notebook GPU kernel, Tesla T4, private",
+    "kernel_url": "https://www.kaggle.com/code/liuzewen123/gkern-triton-softmax-bandwidth",
+    "script_in_repo": "benchmarks/triton/bench_softmax_triton.py",
+    "how": "python -m kaggle kernels push -p /tmp/gkern-kaggle; python -m kaggle kernels output ...",
+    "quota_after_run": "GPU used 26.48h / total 30.00h (remaining 3.52h, refreshAt 2026-11-07T00:00:00)",
+    "note": "唯一允许出现硬件实测数字的文件；数值全部来自该脚本的 do_bench 输出，未手工改过"
+  }
+}

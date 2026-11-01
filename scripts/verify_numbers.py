@@ -37,6 +37,18 @@ EXPECTED = {
     "fusion_unfused_bytes": 74112,
     "fusion_fused_bytes": 49536,
     "fusion_saved_bytes": 24576,
+    # 共享内存与复用上界（P0-A 新增）
+    "smem_bytes_tile32": 4456448,
+    "bank_conflicts_pitch32": 992,
+    "bank_conflicts_pitch33": 0,
+    "reuse_crossover_n": 1536,
+    "reuse_ai_n512_rounded": 88.0,
+    "reuse_ai_n2048_rounded": 352.0,
+    # 云端实测对账（证据 = benchmarks/results/triton_softmax_t4.json）
+    "t4_bandwidth_gbps": 320.0,
+    "t4_crossover_rounded": 25.44,
+    "t4_measured_over_predicted_4096": 1.398,
+    "t4_speedup_vs_eager_512": 0.741,
 }
 
 failures: list[str] = []
@@ -139,6 +151,70 @@ for doc in ("README.md", "docs/jd-mapping.md"):
         print(f"FAIL {doc}_test_count_missing: 文档里找不到「N 个测试」")
         continue
     check(f"doc_test_count[{doc}]", int(claimed.group(1)), _real_count)
+
+# 4c. 共享内存：不改全局字节、bank 冲突按 warp 分组、复用上界只在 n>=1536 翻转
+from gkern.compiler import compile_kernel, costmodel  # noqa: E402
+from gkern.ops import matmul as _mm  # noqa: E402
+from gkern.ops import run_matmul, run_smem_column  # noqa: E402
+
+_a256 = rng.standard_normal((256, 256)).astype(np.float32)
+_b256 = rng.standard_normal((256, 256)).astype(np.float32)
+_plain = run_matmul(_a256, _b256, bm=32, bn=32, bk=16)
+_smem = run_matmul(_a256, _b256, bm=32, bn=32, bk=16, use_smem=True)
+check("smem_bytes_tile32", _plain.cost.bytes_total, EXPECTED["smem_bytes_tile32"])
+check("smem_bytes_equal_global", _smem.cost.bytes_total, _plain.cost.bytes_total)
+check("smem_numerically_equal",
+      bool(np.allclose(_smem.output, _plain.output, atol=1e-5)), True)
+
+_col32 = run_smem_column(32)
+_col33 = run_smem_column(33)
+check("bank_conflicts_pitch32", _col32.stats.shared_bank_conflicts,
+      EXPECTED["bank_conflicts_pitch32"])
+check("bank_conflicts_pitch33", _col33.stats.shared_bank_conflicts,
+      EXPECTED["bank_conflicts_pitch33"])
+
+check("reuse_crossover_n", int(6 * costmodel.crossover_intensity(dev)),
+      EXPECTED["reuse_crossover_n"])
+for _n, _key, _bound in ((512, "reuse_ai_n512_rounded", "memory"),
+                         (2048, "reuse_ai_n2048_rounded", "compute")):
+    _z = np.zeros((_n, _n), dtype=np.float32)
+    _prog = compile_kernel(_mm.matmul_tiled, {"A": _z, "B": _z, "C": _z},
+                           {"M": _n, "N": _n},
+                           {"BM": 64, "BN": 64, "BK": 16, "K": _n},
+                           (_n // 64, _n // 64))
+    _up = costmodel.reuse_bound(_prog)
+    check(_key, round(_up.arithmetic_intensity, 4), EXPECTED[_key])
+    check(f"reuse_bound_n{_n}", _up.bound, _bound)
+    check(f"reuse_is_upper_bound_n{_n}",
+          bool(_up.bytes_total < costmodel.analyze(_prog).bytes_total), True)
+
+# 4d. 云端实测对账：分子来自落盘证据、分母来自可复算的模型
+from gkern.compiler import compile_kernel as _ck  # noqa: E402
+from gkern.gpgpu.device import DeviceInfo as _DI  # noqa: E402
+from gkern.ops.softmax import softmax_rows as _softmax_rows  # noqa: E402
+
+_t4 = _DI.tesla_t4()
+check("t4_bandwidth_gbps", round(_t4.theoretical_bandwidth_gbps, 1),
+      EXPECTED["t4_bandwidth_gbps"])
+check("t4_crossover_rounded",
+      round(costmodel.crossover_intensity(_t4), 2), EXPECTED["t4_crossover_rounded"])
+
+_ev_path = _root / "benchmarks" / "results" / "triton_softmax_t4.json"
+_ev = __import__("json").loads(_ev_path.read_text(encoding="utf-8"))
+check("cloud_evidence_rows", len(_ev["rows"]), 5)
+check("cloud_evidence_has_provenance", "provenance" in _ev, True)
+_r4096 = next(r for r in _ev["rows"] if r["cols"] == 4096)
+_m = _ck(_softmax_rows,
+         {"X": np.zeros((_r4096["rows"], 4096), np.float32),
+          "Y": np.zeros((_r4096["rows"], 4096), np.float32)},
+         {"M": _r4096["rows"], "N": 4096}, {"BLOCK_N": 4096}, (_r4096["rows"],))
+_pred = costmodel.analyze(_m, _t4).predicted_ms
+check("t4_measured_over_predicted_4096",
+      round(_r4096["triton_ms"] / _pred, 3),
+      EXPECTED["t4_measured_over_predicted_4096"])
+_r512 = next(r for r in _ev["rows"] if r["cols"] == 512)
+check("t4_speedup_vs_eager_512", _r512["speedup_vs_eager"],
+      EXPECTED["t4_speedup_vs_eager_512"])
 
 # 5. 事务计数函数本身的 128B 分段语义（防「计数尺」漂移）
 check("count_transactions_128B_split",

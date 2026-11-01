@@ -15,7 +15,8 @@ from typing import Dict, Iterable, Optional
 
 import numpy as np
 
-from .ir import Program, StoreInstr, Tile
+from .ir import Program, SmemStoreInstr, StoreInstr, Tile
+from ..gpgpu.memory import MemoryStats, SharedMemory
 
 _BINARY = {
     "add": np.add,
@@ -71,15 +72,29 @@ _UNARY = {
 }
 
 
-def execute(program: Program, buffers: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-    """执行一个 Program，返回输出缓冲区（就地写回 ``buffers``）。"""
+def execute(program: Program, buffers: Dict[str, np.ndarray],
+            stats: Optional[MemoryStats] = None) -> Dict[str, np.ndarray]:
+    """执行一个 Program，返回输出缓冲区（就地写回 ``buffers``）。
+
+    ``stats`` 用来收集共享内存侧的计数（bank 冲突、访问次数）。
+    全局访存的计数不在这里：那是 :class:`gkern.gpgpu.memory.GlobalMemory` 的职责。
+    """
     for name in program.inputs:
         if name not in buffers:
             raise KeyError(f"缺少输入缓冲区 {name}")
+    st = stats if stats is not None else MemoryStats()
     grid = _grid_offsets(program.grid)
     for pid_coord in grid:
-        _execute_block(program, buffers, pid_coord)
+        _execute_block(program, buffers, pid_coord, st)
     return {name: buffers[name] for name in program.outputs}
+
+
+def run_with_stats(program: Program, buffers: Dict[str, np.ndarray],
+                   ) -> tuple[Dict[str, np.ndarray], MemoryStats]:
+    """执行并返回 (输出, 共享内存统计)。这是 bank 冲突断言的取数入口。"""
+    stats = MemoryStats()
+    outputs = execute(program, buffers, stats)
+    return outputs, stats
 
 
 def _grid_offsets(grid) -> Iterable[tuple]:
@@ -90,9 +105,25 @@ def _grid_offsets(grid) -> Iterable[tuple]:
 
 
 def _execute_block(program: Program, buffers: Dict[str, np.ndarray],
-                   pid_coord: tuple) -> None:
+                   pid_coord: tuple, stats: MemoryStats) -> None:
     values: Dict[int, np.ndarray] = {}
+    # 共享内存是「每个 block 一份」，所以在这里按 block 新建（不是每个 program 共享）
+    smem = {
+        name: SharedMemory(int(np.prod(shape)), stats=stats,
+                           item_bytes=np.dtype(dtype).itemsize)
+        for name, (shape, dtype) in program.smem.items()
+    }
     for node in program.instrs:
+        if isinstance(node, SmemStoreInstr):
+            offs = np.asarray(values[node.offsets], dtype=np.int64)
+            val = np.asarray(values[node.value], dtype=np.float32)
+            mask = (np.asarray(values[node.mask], dtype=bool) if node.mask is not None
+                    else np.ones(offs.shape, dtype=bool))
+            shape = np.broadcast_shapes(offs.shape, val.shape, mask.shape)
+            smem[node.smem].store(np.broadcast_to(offs, shape),
+                                  np.broadcast_to(val, shape),
+                                  np.broadcast_to(mask, shape))
+            continue
         if isinstance(node, StoreInstr):
             offs = values[node.offsets]
             val = values[node.value]
@@ -107,11 +138,12 @@ def _execute_block(program: Program, buffers: Dict[str, np.ndarray],
                 m = np.broadcast_to(mask, shape)
                 buf[offs_b[m]] = val_b[m]
             continue
-        values[node.id] = _eval(node, values, buffers, pid_coord)
+        values[node.id] = _eval(node, values, buffers, pid_coord, smem)
 
 
 def _eval(node: Tile, values: Dict[int, np.ndarray],
-          buffers: Dict[str, np.ndarray], pid_coord: tuple) -> np.ndarray:
+          buffers: Dict[str, np.ndarray], pid_coord: tuple,
+          smem: Dict[str, SharedMemory]) -> np.ndarray:
     op = node.op
     if op == "program_id":
         axis = node.attrs.get("axis", 0)
@@ -134,6 +166,13 @@ def _eval(node: Tile, values: Dict[int, np.ndarray],
         safe = np.clip(offs, 0, buf.shape[0] - 1)
         vals = buf[safe]
         return np.where(valid, vals, np.asarray(other, dtype=buf.dtype))
+    if op == "smem_load":
+        offs = np.asarray(values[node.args[0]], dtype=np.int64)
+        if len(node.args) > 1:
+            mask = np.broadcast_to(values[node.args[1]], offs.shape).astype(bool)
+        else:
+            mask = np.ones(offs.shape, dtype=bool)
+        return smem[node.attrs["smem"]].load(offs, mask)
     if op in _COMPARE:
         return _COMPARE[op](values[node.args[0]], values[node.args[1]])
     if op == "and":

@@ -21,7 +21,9 @@ import time
 
 import numpy as np
 
-from gkern.ops import run_fused_mlp, run_matmul, run_softmax, run_vector_add
+from gkern.compiler import compile_kernel, costmodel
+from gkern.ops import (matmul, run_fused_mlp, run_matmul, run_smem_column,
+                       run_softmax, run_vector_add)
 
 OUT_DIR = pathlib.Path(__file__).resolve().parent / "results"
 
@@ -118,9 +120,57 @@ def main() -> None:
             "outputs_close": bool(np.allclose(fused.output, unfused.output, atol=1e-5)),
         })
 
+    # 共享内存分块：全局字节必须与 global-only 版**完全相等**（smem 不改 HBM 流量）
+    smem_rows = []
+    for tile in (32, 64):
+        a = rng.standard_normal((256, 256)).astype(np.float32)
+        b = rng.standard_normal((256, 256)).astype(np.float32)
+        plain = run_matmul(a, b, bm=tile, bn=tile, bk=16)
+        smem = run_matmul(a, b, bm=tile, bn=tile, bk=16, use_smem=True)
+        smem_rows.append({
+            "tile": tile,
+            "bytes_plain": plain.cost.bytes_total,
+            "bytes_smem": smem.cost.bytes_total,
+            "bytes_equal": bool(plain.cost.bytes_total == smem.cost.bytes_total),
+            "close": bool(np.allclose(smem.output, plain.output, atol=1e-5)),
+        })
+
+    # bank 冲突：行宽 32 与 33 的对比（padding 的作用）
+    col_no_pad = run_smem_column(32)
+    col_pad = run_smem_column(33)
+    bank_rows = [
+        {"pitch": 32, "accesses": col_no_pad.stats.shared_accesses,
+         "conflicts": col_no_pad.stats.shared_bank_conflicts,
+         "rate": round(col_no_pad.stats.shared_conflict_rate, 4)},
+        {"pitch": 33, "accesses": col_pad.stats.shared_accesses,
+         "conflicts": col_pad.stats.shared_bank_conflicts,
+         "rate": round(col_pad.stats.shared_conflict_rate, 4)},
+    ]
+
+    # 复用上界：只 trace 不执行（n=2048 跑一遍要几十秒，而代价模型不需要执行）
+    reuse_rows = []
+    for n in (512, 1024, 2048):
+        z = np.zeros((n, n), dtype=np.float32)
+        prog = compile_kernel(matmul.matmul_tiled, {"A": z, "B": z, "C": z},
+                              {"M": n, "N": n}, {"BM": 64, "BN": 64, "BK": 16, "K": n},
+                              (n // 64, n // 64))
+        lower = costmodel.analyze(prog)
+        upper = costmodel.reuse_bound(prog)
+        reuse_rows.append({
+            "n": n,
+            "lower_bytes": lower.bytes_total,
+            "lower_ai": round(lower.arithmetic_intensity, 4),
+            "lower_bound": lower.bound,
+            "reuse_bytes": upper.bytes_total,
+            "reuse_ai": round(upper.arithmetic_intensity, 4),
+            "reuse_bound": upper.bound,
+        })
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     (OUT_DIR / "bench.json").write_text(
-        json.dumps({"kernels": rows, "fusion": fusion_rows}, indent=2, ensure_ascii=False),
+        json.dumps({"kernels": rows, "fusion": fusion_rows, "smem": smem_rows,
+                    "bank": bank_rows, "reuse": reuse_rows},
+                   indent=2, ensure_ascii=False),
         encoding="utf-8")
 
     header = "| kernel | shape | numpy 墙钟 (ms) | 模型预测 (µs) | 访存 (B) | FLOP | 算术强度 | 受限类型 |"
@@ -136,6 +186,23 @@ def main() -> None:
         lines.append(f"| {f['shape']} | {f['unfused_bytes']} | {f['fused_bytes']} | "
                      f"{f['saved_bytes']} | {f['expected_2_times_intermediate']} | "
                      f"{f['saved_fraction']} | {f['match']} | {f['outputs_close']} | {f['note']} |")
+    lines.append("")
+    lines.append("| tile | 未用 smem 访存 (B) | 用 smem 访存 (B) | 字节相等 | 数值一致 |")
+    lines.append("|---|---:|---:|---|---|")
+    for r in smem_rows:
+        lines.append(f"| {r['tile']} | {r['bytes_plain']} | {r['bytes_smem']} | "
+                     f"{r['bytes_equal']} | {r['close']} |")
+    lines.append("")
+    lines.append("| 共享内存行宽 (float) | 访问次数 | bank 冲突轮次 | 冲突率 |")
+    lines.append("|---|---:|---:|---:|")
+    for r in bank_rows:
+        lines.append(f"| {r['pitch']} | {r['accesses']} | {r['conflicts']} | {r['rate']} |")
+    lines.append("")
+    lines.append("| 方阵 n | 逐块重读下界 (B) | 下界 AI | 下界受限 | 理想复用上界 (B) | 上界 AI | 上界受限 |")
+    lines.append("|---|---:|---:|---|---:|---:|---|")
+    for r in reuse_rows:
+        lines.append(f"| {r['n']} | {r['lower_bytes']} | {r['lower_ai']} | {r['lower_bound']} | "
+                     f"{r['reuse_bytes']} | {r['reuse_ai']} | {r['reuse_bound']} |")
     table = "\n".join(lines)
     (OUT_DIR / "bench.md").write_text(table + "\n", encoding="utf-8")
     print(table)

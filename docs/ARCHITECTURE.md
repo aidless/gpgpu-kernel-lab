@@ -72,14 +72,14 @@
 的 lane，所以 `BN ∤ N` 时它偏大。这条边界在 `tests/test_ops.py::test_fusion_byte_is_static_tile_estimate`
 和 `benchmarks/results/bench.md` 的尾块对照行里都钉死了。**不要**把 `2×|C|` 当恒定公式四处引用。
 
-## 5. PyTorch 适配：三层，逐层收缩支持面
+## 5. PyTorch 适配：四层，逐层收缩支持面
 
 ```
 torch.library 自定义算子 (custom_ops.py)   ← 最稳：单算子，autograd 齐备，任意图都能用
         ↑
 torch.compile 自定义后端 (backend.py + fx_lower.py)  ← 最激进：整图融合，支持面最窄
         ↑
-（未来）PrivateUse1 设备后端              ← 让 torch.device("gkern") 成为一等公民
+PrivateUse1 设备后端 (device_backend.py)   ← 设备能建出来，但分配器与算子内核仍缺（骨架）
 ```
 
 `fx_lower.try_lower` 的设计原则：**接不住就抛 `UnsupportedGraph` 并写清原因**，
@@ -100,6 +100,30 @@ float64、运行期悄悄降精度，正是 `torch.compile` 最典型的 dtype �
 
 「静默给错结果」比「明确回退」危险得多，所以这里宁可回退得多。
 
+### 5.1 PrivateUse1 骨架：把「设备存在」与「算子能跑」分开
+
+`device_backend.register_device_backend("gkern")` 做三件事：
+`torch.utils.rename_privateuse1_backend`（把预留的 `privateuseone` 改名）、
+`torch._register_device_module`（提供 `device_count` / `current_device` /
+`synchronize` / `get_device_properties` 等查询）、
+`generate_methods_for_privateuse1_backend`（生成 `Tensor.gkern()` 这类迁移方法）。
+做完之后 `torch.device("gkern", 0)` 合法、`torch.gkern.device_count() == 1`。
+
+**但 `torch.empty(4, device="gkern")` 仍然抛 `NotImplementedError`**，这是刻意的：
+PrivateUse1 的内存分配只能在 C++ 侧注册（`c10::PrivateUse1Allocator` +
+`TORCH_LIBRARY_IMPL(aten, PrivateUse1, m)`），纯 Python 接管不了 `aten::empty` 的
+dispatch。这条失败被 `tests/test_device_backend.py` 写成断言——**宁可它红，
+也不要一个「数值对、设备掺假」的假成功**。
+
+`device_backend.GAPS` 是机器可读的缺口清单（分配器 / 算子内核 / stream-event /
+设备侧 autograd / 显存统计），`describe()` 输出「接了哪几层、没接哪几层」，
+README 与本文档引用它而不手写，避免文档与代码漂移。
+
+为什么要单列这一层：`torch.compile(backend="gkern")` 只接管**图的分段与执行**，
+张量仍在 CPU 上、设备语义不变；PrivateUse1 要求张量真的具有第三种设备类型、
+`aten` 的 dispatch key 切到 PrivateUse1。把两者混为一谈，是国产卡适配材料里
+最常见的一处概念错位。
+
 ## 6. 怎么扩展
 
 - **加一个算子**：在 `compiler/dsl.py` 的 `_Tracer` 加方法 + `codegen.py` 的 op 分派加分支 +
@@ -116,3 +140,49 @@ float64、运行期悄悄降精度，正是 `torch.compile` 最典型的 dtype �
 - 不做周期级 GPU 时序仿真（那不是「实验台」，那是另一个 gem5/gpgpusim 项目）。
 - 不追求与 Triton 的 API 兼容（只借用它的心智模型：DSL → IR → pass → codegen）。
 - 不在本机伪造 GPU 实测数字。
+
+## 8. 代价模型的两个口径：下界、复用上界，以及它们都不含什么
+
+同一个 GEMM，`costmodel` 里有两个都能算、但含义完全不同的数：
+
+| 口径 | 函数 | 假设 | 用途 |
+|---|---|---|---|
+| 逐块重读下界 | `analyze(program)` | 每个 program（block）各自把需要的输入从 HBM 读一遍，没有任何跨 block 复用 | 「最坏情况」的访存下界；tile 越大越省，但只到 `AI ≈ N/tile×…` 这个量级 |
+| 理想复用上界 | `reuse_bound(program)` | 每个输入张量全局只读一次、输出只写一次（等价于无限大 L2） | 「最好情况」的上界；方阵 `AI = N/6 + N/192` |
+
+两者的差就是**复用能带来的全部空间**。实测（方阵、`bm=bn=64`、`bk=16`）：
+
+| n | 下界 AI | 上界 AI | 下界受限 | 上界受限 |
+|---:|---:|---:|---|---|
+| 512 | 15.53 | 88.0 | memory | memory |
+| 1024 | 16.00 | 176.0 | memory | memory |
+| 2048 | 16.25 | 352.0 | memory | compute |
+
+结论有两面，都要说清：① **只调 tile 翻不动 bound**——tile 16→128 只把 AI 从 4.27 抬到 29.59，
+离 256 的交叉点差一个数量级；② **在理想复用假设下**，n=2048 的 GEMM 才第一次跨过交叉点，
+而真实硬件靠的是跨 block 的 L2 命中，这正是「上界」三个字的来源。
+
+### 8.1 共享内存分块改变了什么、没改变什么
+
+`matmul_smem` 把 A/B 面板先写进共享内存再参与 `dot`。它**不减少**全局字节：
+`tests/test_smem.py::test_smem_tiling_does_not_change_global_bytes` 断言
+`smem.cost.bytes_total == plain.cost.bytes_total`（tile=32 两版均为 4456448 B）。
+它改变的是取数路径（global → 片上）与 bank 冲突，以及**共享内存容量成为分块上限**
+（48 KiB/block，`bm×bk + bk×bn` 必须放得下）。
+
+### 8.2 这两个口径都不含的东西（已知缺口，不要拿它们当实测）
+
+- **cache 命中**：`analyze` 完全不含 L1/L2；`reuse_bound` 是它的理想极限，不是模拟。
+- **发射开销与指令吞吐**：不含 warp 调度、指令 issue 延迟。
+- **bank 冲突的代价折算**：能数出冲突轮次，但没有把它折成时间。
+- **tile 补齐**：`BN ∤ N` 时按整块 tile 计字节，计数字节大于真实张量字节
+  （`benchmarks/results/bench.md` 里那一行 `match=False` 就是这个口径造成的）。
+- **数值**：CPU 上的墙钟只反映 numpy 向量化，**不是 GPU 时间**，所以本仓库从不报 GFLOPS。
+
+## 9. 共享内存与 bank 冲突的建模粒度
+
+bank 冲突必须**按 warp 分组**统计。硬件一次发射的最小单位是 warp（本模型 32 lane），
+而 `SharedMemory.load` 收到的是一个可能远大于 32 元素的 tile。若把整块当一次访问求
+最大 bank 命中数，会得出「1024 次无冲突写全撞在 32 个 bank 上、31 倍冲突」这种不存在的结论
+（实测纠正：行宽 32 从 32736 → 992，行宽 33 从 31744 → 0）。所以有 `warp_bank_conflicts()`
+按 32 分组求和，`SharedMemory` 内部也只用它。

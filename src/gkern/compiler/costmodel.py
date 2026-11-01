@@ -22,7 +22,7 @@ from typing import Dict
 
 import numpy as np
 
-from .ir import Program, StoreInstr, Tile
+from .ir import Program, SmemStoreInstr, StoreInstr, Tile
 from ..gpgpu.device import DeviceInfo
 
 
@@ -35,6 +35,8 @@ class Cost:
     flops: int
     programs: int
     device: DeviceInfo
+    #: True 表示这是「每个输入只从 HBM 读一次」的理想复用上界，而不是逐块重读的下界
+    reuse: bool = False
 
     @property
     def bytes_total(self) -> int:
@@ -66,6 +68,7 @@ class Cost:
 
     def as_dict(self) -> dict:
         return {
+            "reuse": self.reuse,
             "bytes_read": self.bytes_read,
             "bytes_written": self.bytes_written,
             "bytes_total": self.bytes_total,
@@ -84,6 +87,9 @@ def analyze(program: Program, device: DeviceInfo | None = None) -> Cost:
     dev = device or DeviceInfo()
     read = written = flops = 0
     for node in program.instrs:
+        if isinstance(node, SmemStoreInstr):
+            # 共享内存写不是 HBM 流量。这条 if 是 smem 分块版不被算成「多几倍访存」的原因。
+            continue
         if isinstance(node, StoreInstr):
             val = program.tile(node.value)
             written += val.nbytes
@@ -95,13 +101,18 @@ def analyze(program: Program, device: DeviceInfo | None = None) -> Cost:
             b = program.tile(node.args[1])
             flops += 2 * a.shape[0] * a.shape[1] * b.shape[1]
         elif node.op in ("add", "sub", "mul", "div", "maximum"):
-            flops += node.numel
+            # 只统计浮点运算：地址算术（int64 的乘加）不是 FLOP。
+            # 不排除它的话，GEMM 的 AI 会被偏移量计算抬高约 4.8%，roofline 判定跟着漂。
+            if np.issubdtype(node.dtype, np.floating):
+                flops += node.numel
         elif node.op in ("exp", "log", "sqrt", "rsqrt", "neg", "tanh"):
             # 先按 1 FLOP 计，实际 SFU 吞吐低得多；这里只用于「是否算力受限」的量级判断
-            flops += node.numel
+            if np.issubdtype(node.dtype, np.floating):
+                flops += node.numel
         elif node.op in ("sum", "max"):
             src = program.tile(node.args[0])
-            flops += src.numel
+            if np.issubdtype(src.dtype, np.floating):
+                flops += src.numel
     programs = int(np.prod(program.grid))
     return Cost(
         bytes_read=read * programs,
@@ -110,3 +121,37 @@ def analyze(program: Program, device: DeviceInfo | None = None) -> Cost:
         programs=programs,
         device=dev,
     )
+
+
+def crossover_intensity(device: DeviceInfo | None = None) -> float:
+    """roofline 的交叉点：AI 超过它才是 compute bound。本机假设机为 256 FLOP/B。"""
+    dev = device or DeviceInfo()
+    return dev.peak_flops_tflops * 1e12 / (dev.theoretical_bandwidth_gbps * 1e9)
+
+
+def reuse_bound(program: Program, device: DeviceInfo | None = None) -> Cost:
+    """理想 L2 复用下的访存**上界**：每个输入只从 HBM 读一次，每个输出只写一次。
+
+    这个数与 :func:`analyze` 的下界配对使用，回答的是两个不同问题：
+
+    - ``analyze``：如果每个 block 都老实从 HBM 重新读自己的面板（无缓存），
+      代价是多少？——下界口径，矩阵乘法下一定是 memory bound。
+    - ``reuse_bound``：如果 L2 足够大、面板被跨 block 复用命中，代价是多少？
+      ——才是真实 GPU 能摸到的口径。
+
+    方阵 GEMM 在完美复用下 ``AI = 2N^3 / (12N^2) = N/6``，
+    所以交叉点 256 FLOP/B 需要 **N >= 1536**——这就是「光调 tile 翻不动 bound」的算术原因。
+    """
+    dev = device or DeviceInfo()
+    written_names = {node.buffer for node in program.instrs
+                     if isinstance(node, StoreInstr)}
+    read = written = 0
+    for name, (shape, dtype) in program.inputs.items():
+        nbytes = Tile(0, "buffer", shape, dtype).nbytes
+        if name in written_names:
+            written += nbytes
+        else:
+            read += nbytes
+    flops = analyze(program, dev).flops
+    return Cost(bytes_read=read, bytes_written=written, flops=flops,
+                programs=int(np.prod(program.grid)), device=dev, reuse=True)

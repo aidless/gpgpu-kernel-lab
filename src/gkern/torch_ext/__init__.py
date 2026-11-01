@@ -5,6 +5,7 @@
 - :mod:`gkern.torch_ext.custom_ops` —— ``torch.library`` 自定义算子（实现 + fake + autograd + schema）
 - :mod:`gkern.torch_ext.fx_lower` —— FX 图 → gkern IR 的下沉器（接不住必须给原因）
 - :mod:`gkern.torch_ext.backend` —— ``torch.compile(backend="gkern")`` 的自定义后端
+- :mod:`gkern.torch_ext.device_backend` —— PrivateUse1 **设备**后端骨架（与上一个不是同一件事）
 
 注意：``torch`` 是本包的运行时依赖（在 ``pyproject.toml`` 里声明），但为了让
 ``import gkern`` 在没装 torch 的环境里也能用（只想跑 SIMT 模型/编译器部分的人），
@@ -13,7 +14,8 @@
 
 from __future__ import annotations
 
-__all__ = ["custom_ops", "fx_lower", "backend", "CompileReport", "register_backend", "compile"]
+__all__ = ["custom_ops", "fx_lower", "backend", "device_backend", "CompileReport",
+           "register_backend", "compile", "register_device_backend"]
 
 
 def __getattr__(name: str):
@@ -26,7 +28,11 @@ def __getattr__(name: str):
         from . import backend
 
         return getattr(backend, name)
-    if name in ("custom_ops", "fx_lower", "backend"):
+    if name == "register_device_backend":
+        from . import device_backend
+
+        return device_backend.register_device_backend
+    if name in ("custom_ops", "fx_lower", "backend", "device_backend"):
         import importlib
 
         return importlib.import_module(f"{__name__}.{name}")

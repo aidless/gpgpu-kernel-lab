@@ -133,6 +133,25 @@ class GlobalMemory:
         buf[indices[valid]] = values[valid]
 
 
+def warp_bank_conflicts(indices: np.ndarray, item_bytes: int = 4,
+                        bank_count: int = BANK_COUNT,
+                        warp_size: int = 32) -> int:
+    """按 **warp 粒度** 统计共享内存访问的额外轮次（冲突数）。
+
+    为什么必须按 32 个 lane 分组：一个 warp 才是硬件真正一起发射的单位。
+    整块 tile 一次性算 ``bank_conflict_degree`` 会得出「1024 次访问全撞在
+    32 个 bank 上」这种不存在的结论（实测把一次无冲突的整块写算成 31 倍冲突）。
+    """
+    indices = np.asarray(indices, dtype=np.int64).reshape(-1)
+    extra = 0
+    for start in range(0, indices.size, warp_size):
+        group = indices[start:start + warp_size]
+        degree = bank_conflict_degree(group * item_bytes, bank_count, item_bytes)
+        if degree > 1:
+            extra += int(group.size) * (degree - 1)
+    return extra
+
+
 class SharedMemory:
     """每 block 一块共享内存，带 bank 冲突统计。
 
@@ -152,11 +171,9 @@ class SharedMemory:
         indices = np.asarray(indices, dtype=np.int64)
         mask = np.asarray(mask, dtype=bool)
         active = indices[mask]
-        degree = bank_conflict_degree(active * self.item_bytes, self.bank_count,
-                                      self.item_bytes)
         self.stats.shared_accesses += int(active.size)
-        if degree > 1:
-            self.stats.shared_bank_conflicts += int(active.size) * (degree - 1)
+        self.stats.shared_bank_conflicts += warp_bank_conflicts(
+            active, self.item_bytes, self.bank_count)
         out = np.zeros(indices.shape, dtype=np.float32)
         valid = mask & (indices >= 0) & (indices < self.data.shape[0])
         out[valid] = self.data[indices[valid]]
@@ -166,10 +183,8 @@ class SharedMemory:
         indices = np.asarray(indices, dtype=np.int64)
         mask = np.asarray(mask, dtype=bool)
         active = indices[mask]
-        degree = bank_conflict_degree(active * self.item_bytes, self.bank_count,
-                                      self.item_bytes)
         self.stats.shared_accesses += int(active.size)
-        if degree > 1:
-            self.stats.shared_bank_conflicts += int(active.size) * (degree - 1)
+        self.stats.shared_bank_conflicts += warp_bank_conflicts(
+            active, self.item_bytes, self.bank_count)
         valid = mask & (indices >= 0) & (indices < self.data.shape[0])
         self.data[indices[valid]] = values[valid]

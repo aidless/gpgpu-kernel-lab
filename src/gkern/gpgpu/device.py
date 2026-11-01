@@ -35,6 +35,33 @@ class DeviceInfo:
     fp32_cores_per_sm: int = 128       # 每 SM 的 FP32 单元数
     clock_ghz: float = 1.6             # 核心频率
 
+    @classmethod
+    def tesla_t4(cls) -> "DeviceInfo":
+        """NVIDIA T4 的等效参数（用于把代价模型与云端实测放在同一把尺上）。
+
+        T4 的公开规格：40 个 SM、Tensor Core 版 Turing、显存 16 GB（可用 15 GB 左右）、
+        显存带宽 320 GB/s。这里把 ``memory_clock_ghz`` 与 ``bus_width_bits`` 取成
+        「等效值」——本模型只用到两者的乘积，所以选 ``5.0 GHz × 256 bit`` 使
+        ``theoretical_bandwidth_gbps`` 恰好等于 320.0，而不是去还原物理时钟。
+
+        FP32 峰值按本模型公式 ``sm_count × fp32_cores_per_sm × 2 × clock_ghz`` 算得
+        8.141 TFLOPS，与 T4 公开的 8.1 TFLOPS 相符（T4 每个 SM 64 个 FP32 单元、
+        主频 1.59 GHz），roofline 交叉点因此是 25.44 FLOP/B——比假设国产卡的 256.0
+        低一个数量级。这正是「同一份 kernel 在不同卡上受限类型可能相反」的来源。
+        """
+        return cls(
+            name="nvidia-tesla-t4",
+            sm_count=40,
+            max_warps_per_sm=48,
+            shared_memory_per_block=48 * 1024,
+            registers_per_sm=64 * 1024,
+            l2_bytes=4 * 1024 * 1024,
+            memory_clock_ghz=5.0,
+            bus_width_bits=256,
+            fp32_cores_per_sm=64,
+            clock_ghz=1.59,
+        )
+
     @property
     def threads_per_block_limit(self) -> int:
         """一个 block 的线程数上限（由每 SM warp 上限推出）。"""
