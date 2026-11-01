@@ -300,7 +300,7 @@ softmax 在四个位置降精度（输入、行最大值、指数结果、归约
 ## 测试与自检闸
 
 ```bash
-pytest                                    # 134 passed（含 C++ 扩展；未构建扩展时 112 passed + 22 skipped）
+pytest                                    # 134 passed（含 C++ 扩展；未构建扩展时 112 passed + 1 个模块级 skip）
 PYTHONPATH=src python3 scripts/verify_numbers.py            # 重算文档里每个数字
 PYTHONPATH=src python3 scripts/verify_numbers.py --selftest # 证明这个闸会红
 ```
