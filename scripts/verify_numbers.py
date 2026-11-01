@@ -33,6 +33,7 @@ EXPECTED = {
     "divergence_rate_mixed": 1.0,
     "divergence_rate_positive": 0.0,
     "lane_efficiency_mixed_rounded": 0.667,
+    "lane_efficiency_positive_rounded": 1.0,
     "fusion_unfused_bytes": 74112,
     "fusion_fused_bytes": 49536,
     "fusion_saved_bytes": 24576,
@@ -80,6 +81,19 @@ check("divergence_rate_mixed", ms["divergence_rate"], EXPECTED["divergence_rate_
 check("lane_efficiency_mixed_rounded",
       round(ms["warp_efficiency"], 3), EXPECTED["lane_efficiency_mixed_rounded"])
 
+# 3b. 全正输入：没有 lane 走 else 分支 → 发散率必须为 0、lane 效率必须为 1
+#     （早期这个 EXPECTED 条目写了却从没断言，是一行死代码；现在补上真检查）
+from gkern.gpgpu.kernel import launch  # noqa: E402
+
+a_pos = np.abs(rng.standard_normal(n)).astype(np.float32) + 0.01
+out_pos = np.zeros(n, dtype=np.float32)
+pos_res = launch(relu_branchy, {"a": a_pos, "out": out_pos},
+                 grid=((n + 255) // 256,), block=(256,), extra=(n,))
+ps = pos_res.summary()
+check("divergence_rate_positive", ps["divergence_rate"], EXPECTED["divergence_rate_positive"])
+check("lane_efficiency_positive_rounded",
+      round(ps["warp_efficiency"], 3), EXPECTED["lane_efficiency_positive_rounded"])
+
 # 4. 融合省访存（等式，不是估计）
 m, k, nn = 64, 32, 48
 a = rng.standard_normal((m, k)).astype(np.float32)
@@ -95,6 +109,36 @@ check("fusion_saved_equals_2_times_C",
       unfused.cost.bytes_total - fused.cost.bytes_total == 2 * m * nn * 4, True)
 check("fusion_numerically_equal",
       bool(np.allclose(fused.output, unfused.output, atol=1e-5)), True)
+
+# 4b. 文档里的测试数必须与真实收集数一致（漂移过两次：58→68→74）
+#     数字类文档断言最容易腐烂，所以把它也做成可复算项，而不是靠人记得改。
+import pathlib  # noqa: E402
+import re  # noqa: E402
+import subprocess  # noqa: E402
+
+_root = pathlib.Path(__file__).resolve().parent.parent
+_collected = subprocess.run(
+    [sys.executable, "-m", "pytest", "tests", "-o", "addopts=", "--collect-only", "-q"],
+    cwd=_root, capture_output=True, text=True,
+    # 注意：不能传绝对 PYTHONPATH——本机工作区目录名是 ``F:\deepseek``，
+    # 里面含一个冒号，会被 os.pathsep 拆成两段，导致 3 个测试模块 import 失败、
+    # 收集数被算成 20。用相对路径 + cwd 才是稳的（CI 上同理）。
+    env={**__import__("os").environ, "PYTHONPATH": "src"},
+)
+_tail = re.search(r"(\d+) tests collected", _collected.stdout)
+if _tail is None:
+    print("FAIL test_count_unreadable: 无法从 pytest --collect-only 输出里读到用例数")
+    print(_collected.stdout[-2000:])
+    sys.exit(2)
+_real_count = int(_tail.group(1))
+for doc in ("README.md", "docs/jd-mapping.md"):
+    text = (_root / doc).read_text(encoding="utf-8")
+    claimed = re.search(r"(\d+) 个测试", text)
+    if claimed is None:
+        failures.append(f"{doc}_test_count_missing")
+        print(f"FAIL {doc}_test_count_missing: 文档里找不到「N 个测试」")
+        continue
+    check(f"doc_test_count[{doc}]", int(claimed.group(1)), _real_count)
 
 # 5. 事务计数函数本身的 128B 分段语义（防「计数尺」漂移）
 check("count_transactions_128B_split",

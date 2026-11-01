@@ -39,7 +39,7 @@
 ```bash
 cd gpgpu-kernel-lab
 pip install -e ".[dev]"          # numpy + torch + pytest
-pytest                            # 68 个测试，约 12 秒
+pytest                            # 89 个测试，约 11 秒
 PYTHONPATH=src python3 examples/quickstart.py
 PYTHONPATH=src python3 benchmarks/run_benchmarks.py
 ```
@@ -118,7 +118,7 @@ src/gkern/
 
 ---
 
-## 开发中实际踩到并修掉的六个坑
+## 开发中实际踩到并修掉的八个坑
 
 每一条都是**先有失败的症状、再定位根因**，不是事后编的故事：
 
@@ -134,19 +134,35 @@ src/gkern/
 4. **二维缓冲区被当二维索引**（`compiler/codegen.py`）。GPU 的地址空间是一维的，
    2D numpy 数组直接拿算出来的线性下标去索引会 `TypeError`。修法：一律 `reshape(-1)`。
 5. **融合后残留中间缓冲区**（`compiler/passes.py`）。融合把 C 的写读都消掉了，
-   却还在 `inputs` 里留了 `C`，执行时报 `KeyError: 缺少输入缓冲区 C`。修法：`pop` 掉。
-6. **`register_autograd` 签名变了**（`torch_ext/custom_ops.py`）。2.14 上是
+   却还在 `inputs` 里留了 `C`，执行时报 `KeyError: 缺少输入缓冲区 C`。
+   修法：`pop` 掉——但**只在 A 自己不读 C 时**成立。就地读写的生产者被 `pop` 之后
+   仍会 KeyError，所以这条修法配了判据：`can_fuse` 拒绝「A 也读 buffer」的组合。
+6. **融合判据不足会产出静默错结果**（`compiler/passes.py`，最隐蔽的一个）。
+   早期 `can_fuse` 只查 grid/输出/被读三条，于是 A 写 `C[i]`、B 读 `C[i+1]` 这种
+   halo 访问也被判成可融合，融合后是一整条旋转，`max|Δ| = 1.894` 却**不报错**。
+   同批被误判的还有 shape 不匹配、dtype 不匹配、就地读写、多次写、跨 lane 归约。
+   修法：判据扩到七条（见 `docs/ARCHITECTURE.md` §4），七类都写成拒绝用例
+   （`test_fusion_gate_rejects_*` 共七条），并验证过「拿旧版 `can_fuse` 跑这组测试必红」。
+7. **`register_autograd` 签名变了**（`torch_ext/custom_ops.py`）。2.14 上是
    `register_autograd(backward, *, setup_context=...)`，按早期文档写成位置参数
    `(setup, backward)` 直接 `TypeError`。
    另有一个更要命的：FX 图输出是 `((t,),)`，后端回裸 tensor 会被 Dynamo 按序列取
    `[0]` → 结果变成 0 维标量（实测 `torch.Size([]) != torch.Size([37])`）。
+8. **编译期与运行期语义不一致**（`torch_ext/`，第二隐蔽的一个）。真实实现经 numpy
+   只能算 float32，但 `register_fake` 照单全收任意 dtype：`float64` 输入时 fake 报
+   `float64`、real 悄悄降成 `float32`——`torch.compile` 最典型的「图里说一套、跑出来
+   另一套」。同批还有三处：`fused_mlp` 的 `K % BK == 0` 只在 real 校验（编译期过、
+   运行期炸）、CUDA/meta 张量在 `try_lower` 里没被拒（运行期抛的是与「下沉失败」无关的
+   `TypeError`，Dynamo 侧接不住）、`explain(obj)` 无视参数直接回 `REPORTS` 第一条
+   （问 A 答 B）。修法：real/fake 共用同一份校验、`try_lower` 先拒非 CPU 与符号形状、
+   `REPORTS` 改按 Dynamo 的 `CompileId` 归档。
 
 ---
 
 ## 测试与自检闸
 
 ```bash
-pytest                                    # 68 passed
+pytest                                    # 89 passed
 PYTHONPATH=src python3 scripts/verify_numbers.py            # 重算文档里每个数字
 PYTHONPATH=src python3 scripts/verify_numbers.py --selftest # 证明这个闸会红
 ```
@@ -163,7 +179,9 @@ README/文档里出现的每个数值（26.2144 TFLOPS、102.4 GB/s、64/2048 �
 - `tests/test_ops.py`：六个算子的空输入 / shape 不匹配 / `BLOCK_N < N` / `K % BK`
   等**边界拒绝**。
 - `tests/test_torch_ext.py`：自定义算子前向/反向对拍、`torch.compile` 端到端、
-  五种不支持语义的回退、以及**每一种下沉失败都必须给出原因**。
+  每一种不支持语义的回退都必须给出原因；另有**编译期与运行期语义一致性**的一组：
+  非 float32 在 real/fake 两端都拒绝、`fused_mlp` 的 `K % 16` 与形状约束两边都校验、
+  非 CPU 张量与符号维度在 `try_lower` 就干净回退、`explain(obj)` 只回答**该对象**的结论。
 - `tests/test_package.py`：公开 API 契约（`from gkern.torch_ext import register_backend`
   必须真的可用——这个包曾一度缺 `__init__.py`，`import gkern` 正常但公开名字导入失败）。
 
@@ -185,7 +203,7 @@ README/文档里出现的每个数值（26.2144 TFLOPS、102.4 GB/s、64/2048 �
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)：三档保真度、IR 为什么是线性指令表、融合不变量的边界、三个扩展点。
 - [docs/jd-mapping.md](docs/jd-mapping.md)：招聘要求 ↔ 本仓库可运行证据逐条对照，**含三个必须承认的缺口**。
-- [docs/ecosystem.md](docs/ecosystem.md)：30 个入表仓库（另有 21 个已验真未入表）逐个用 GitHub API 验真，含源码入口级阅读路径与失效路径说明。
+- [docs/ecosystem.md](docs/ecosystem.md)：正表 30 行 / 28 个唯一仓库，附表 21 行 / 相对正表新增 19 个，全文 51 行 / 47 个唯一仓库（全部 2026-10-31 用 GitHub API 复核）逐个用 GitHub API 验真，含源码入口级阅读路径与失效路径说明。
 - [benchmarks/results/bench.md](benchmarks/results/bench.md)：最近一次基准输出（数值墙钟 × 模型预测 × 受限类型 × 融合等式）。
 
 ## 许可证

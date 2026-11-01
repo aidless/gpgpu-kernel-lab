@@ -44,15 +44,28 @@
 
 代价是：`ctx.mask` 必须是**唯一真相**（`warp.mask` 的视图）。开发时踩过的最贵的坑就是
 存了两份（`_mask` 与 `warp.mask`），分支里改了后者、`load/store` 读了前者，
-导致 ReLU 输出全 0。见 README「六个坑」第 1 条。
+导致 ReLU 输出全 0。见 README「八个坑」第 1 条。
 
 ## 4. 融合的不变量：省下的字节 == 2×|C|
 
-`passes.fuse_programs(a, b, buffer)` 的前提由 `can_fuse` 三条判据守住：
+`passes.fuse_programs(a, b, buffer)` 的前提由 `can_fuse` 七条判据守住。这套判据是
+**保守的一对一、逐 lane 对齐**融合，不是一个通用安全闸：
 
 1. `a.grid == b.grid`（同一批 block 一一对应，否则映射不成立）；
-2. `buffer` 由 `a` 写出（`a.outputs` 里有它）；
-3. `b` 确实读过 `buffer`（否则融合没有收益，还会改变语义）。
+2. `a` 对 `buffer` **恰好写一次**（多次写时融合只保留最后一次，前一次会被静默丢弃）；
+3. `a` **不读** `buffer`（就地 read-modify-write 时融合会 `pop` 掉输入 → `KeyError`）；
+4. `b` 对 `buffer` **恰好读一次**（多次读时无法一一替换）；
+5. `a` 写 `buffer` 的地址表达式与 `b` 读它的地址表达式**结构相同**（逐 lane 对齐；
+   否则 halo/stencil 会被融合成一条旋转，产生**静默的错误数值**）；
+6. 写入值的 `shape` 与 `dtype` 与读到的 tile 相同；
+7. `b` 对读到的值只做**逐 lane** 使用——掩码与生产者一致，下游任何 Tile 的 shape
+   不得变化（`sum`/`max`/`dot`/跨 lane 广播会改变 shape，被掩掉的 lane 会污染结果）。
+
+判据 5 的实现是 `_sig()`：把 Tile 及其依赖子图归一成结构签名再比。两个 program
+各自 trace 出来的指令 id 不同，但 `pid*N + arange(...)` 的结构相同，必须判等。
+
+这七条每条都有对应的拒绝用例（`tests/test_compiler.py` 的七个
+`test_fusion_gate_rejects_*`），并且验证过「拿旧版 `can_fuse` 跑这组测试必红」。
 
 融合后省掉的访存恰好是中间缓冲区的一次写 + 一次读 = `2 × |C|`。
 **但这只在分块整除 M/N 时严格成立**——代价模型按「整块 tile 面积」计费，不扣尾部被 mask
@@ -72,9 +85,17 @@ torch.compile 自定义后端 (backend.py + fx_lower.py)  ← 最激进：整图
 `fx_lower.try_lower` 的设计原则：**接不住就抛 `UnsupportedGraph` 并写清原因**，
 `backend.py` 捕获后包一层 `fallback` 调 `gm.forward`，并在 `CompileReport` 里记 `fused=False`
 与原因。当前明确拒绝的情形：`requires_grad`（numpy 会断 autograd）、非 float32、
-输入形状不一致、非连续、非 `call_function` 节点（如 `x.sum()` 是 `call_method`）、
-未知算子、多输出、以及 `alpha=` / `approximate=` 这类**非默认关键字参数**
-（硬接等于悄悄算错）。
+非 **CPU** 张量（runner 经 numpy 计算，meta/CUDA 张量必须先拒，否则运行期抛的是
+与「下沉失败」无关的 `TypeError`）、**符号/动态形状**（`numel`/`grid` 需编译期常量，
+否则抛 data-dependent guard 错误、Dynamo 侧无法按回退处理）、输入形状不一致、
+非连续、非 `call_function` 节点（如 `x.sum()` 是 `call_method`）、未知算子、多输出、
+以及 `alpha=` / `approximate=` 这类**非默认关键字参数**（硬接等于悄悄算错）。
+
+`torch.library` 自定义算子那一层同样守住「编译期 == 运行期」：真实实现走 numpy
+只能算 float32，所以 `register_fake` 也**必须**拒绝非 float32——否则 fake 放行
+float64、运行期悄悄降精度，正是 `torch.compile` 最典型的 dtype 事故。
+`fused_mlp` 的 `K % BK == 0`（IR 无循环，K 是编译期常量）与形状约束在 real/fake
+两端共用同一份校验，不允许「编译期过、运行期炸」。
 
 「静默给错结果」比「明确回退」危险得多，所以这里宁可回退得多。
 

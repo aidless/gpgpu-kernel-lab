@@ -11,7 +11,7 @@ GPU 优化的第一性问题永远是「这个 kernel 是带宽受限还是算�
 
 诚实的边界：这个模型不含 cache 命中、不含指令发射开销、不含 bank 冲突，
 所以它是「下界估计」。它和 :mod:`gkern.gpgpu` 设备模型在同一 kernel 上的
-交叉校验见 ``tests/test_costmodel.py``：对 elementwise 这类访存主导的 kernel，
+交叉校验见 ``tests/test_compiler.py``：对 elementwise 这类访存主导的 kernel，
 两者预测的字节数必须一致（不一致就是模型写错了）。
 """
 

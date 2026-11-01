@@ -1,7 +1,11 @@
 """验证真实 PyTorch 调用、梯度与编译结果；不 mock 编译器。"""
 import pytest
 import torch
+import torch.fx as fx
 import torch.nn.functional as F
+
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 
 def test_custom_scale_gelu_forward_and_backward():
@@ -129,3 +133,181 @@ def test_fused_runner_matches_graph_output_structure():
     out = compiled(x, y)
     assert out.shape == torch.Size([37])
     assert any(r.fused for r in REPORTS.values())
+
+
+# ---------------------------------------------------------------------------
+# F5：真实实现会把输入压成 float32，fake 实现却照单全收 —— 编译期与运行期
+# 的 dtype 语义必须一致，所以非 float32 一律在两边都显式拒绝。
+# ---------------------------------------------------------------------------
+
+def test_scale_gelu_rejects_non_float32_real_and_fake():
+    from gkern.torch_ext.custom_ops import scale_gelu
+    x64 = torch.randn(8, dtype=torch.float64)
+    with pytest.raises(RuntimeError, match="float32"):
+        scale_gelu(x64, 1.0)
+    with FakeTensorMode():
+        fake64 = torch.randn(8, dtype=torch.float64)
+        with pytest.raises(RuntimeError, match="float32"):
+            scale_gelu(fake64, 1.0)
+
+
+def test_scale_gelu_fake_float32_preserves_metadata():
+    from gkern.torch_ext.custom_ops import scale_gelu
+    with FakeTensorMode():
+        out = scale_gelu(torch.randn(8), 2.0)
+        assert out.dtype == torch.float32
+        assert out.shape == torch.Size([8])
+
+
+def test_fused_mlp_rejects_non_float32_real_and_fake():
+    from gkern.torch_ext.custom_ops import fused_mlp
+    a, w, b = (torch.randn(4, 16, dtype=torch.float64),
+               torch.randn(16, 3, dtype=torch.float64),
+               torch.randn(3, dtype=torch.float64))
+    with pytest.raises(RuntimeError, match="float32"):
+        fused_mlp(a, w, b)
+    with FakeTensorMode():
+        fa = torch.randn(4, 16, dtype=torch.float64)
+        fw = torch.randn(16, 3, dtype=torch.float64)
+        fb = torch.randn(3, dtype=torch.float64)
+        with pytest.raises(RuntimeError, match="float32"):
+            fused_mlp(fa, fw, fb)
+
+
+# ---------------------------------------------------------------------------
+# F6：fused_mlp 的 K % 16 约束（以及形状）必须在 real / fake 两边一致校验，
+# 否则编译期放行、运行期报错，或者更糟：编译期接受一个真实实现算不了的形状。
+# ---------------------------------------------------------------------------
+
+def test_fused_mlp_rejects_k_not_multiple_of_block_real_and_fake():
+    from gkern.torch_ext.custom_ops import fused_mlp
+    a, w, b = torch.randn(4, 8), torch.randn(8, 3), torch.randn(3)
+    with pytest.raises(RuntimeError, match="16"):
+        fused_mlp(a, w, b)
+    with FakeTensorMode():
+        fa, fw, fb = torch.randn(4, 8), torch.randn(8, 3), torch.randn(3)
+        with pytest.raises(RuntimeError, match="16"):
+            fused_mlp(fa, fw, fb)
+
+
+@pytest.mark.parametrize("shapes, needle", [
+    (((4, 16), (9, 3), (3,)), "内维"),      # A/W 内维不匹配
+    (((4, 16), (16, 3), (5,)), "bias"),     # bias 形状错
+    (((16,), (16, 3), (3,)), "二维"),        # A 不是二维
+])
+def test_fused_mlp_rejects_bad_shapes_real_and_fake(shapes, needle):
+    from gkern.torch_ext.custom_ops import fused_mlp
+    a = torch.randn(*shapes[0])
+    w = torch.randn(*shapes[1])
+    b = torch.randn(*shapes[2])
+    with pytest.raises(RuntimeError, match=needle):
+        fused_mlp(a, w, b)
+    with FakeTensorMode():
+        fa = torch.randn(*shapes[0])
+        fw = torch.randn(*shapes[1])
+        fb = torch.randn(*shapes[2])
+        with pytest.raises(RuntimeError, match=needle):
+            fused_mlp(fa, fw, fb)
+
+
+def test_fused_mlp_fake_valid_shape_reports_correct_output_shape():
+    from gkern.torch_ext.custom_ops import fused_mlp
+    with FakeTensorMode():
+        out = fused_mlp(torch.randn(4, 16), torch.randn(16, 3), torch.randn(3))
+        assert out.shape == torch.Size([4, 3])
+        assert out.dtype == torch.float32
+
+
+# ---------------------------------------------------------------------------
+# F7：try_lower 必须拒绝非 CPU 张量（meta 可在无 GPU 环境下构造），
+# 并让动态/符号形状干净地回退，而不是抛出一个未被捕获的 guard 错误。
+# ---------------------------------------------------------------------------
+
+def test_lowering_rejects_non_cpu_tensor_meta():
+    from gkern.torch_ext.fx_lower import UnsupportedGraph, try_lower
+    gm = fx.symbolic_trace(lambda x: x * 1.7 + 1.0)
+    meta = torch.empty(37, device="meta")
+    with pytest.raises(UnsupportedGraph, match="设备|device"):
+        try_lower(gm, [meta])
+
+
+def test_lowering_rejects_symbolic_shapes_cleanly():
+    from gkern.torch_ext.fx_lower import UnsupportedGraph, try_lower
+    gm = fx.symbolic_trace(lambda x: x * 1.7 + 1.0)
+    se = ShapeEnv()
+    with FakeTensorMode(shape_env=se) as mode:
+        u = se.create_unbacked_symint()
+        sym = torch.empty(u, device="cpu")
+        assert isinstance(sym.shape[0], torch.SymInt)
+        with pytest.raises(UnsupportedGraph, match="符号|动态|SymInt"):
+            try_lower(gm, [sym])
+
+
+def test_dynamic_shapes_fall_back_cleanly_and_stay_correct():
+    from gkern.torch_ext.backend import REPORTS, gkern_backend
+    torch._dynamo.reset()
+    REPORTS.clear()
+    fn = lambda x, y: F.gelu(x * 1.7 + y) * 0.5 + x
+    compiled = torch.compile(fn, backend=gkern_backend, dynamic=True)
+    for n in (37, 53, 64):
+        x, y = torch.randn(n), torch.randn(n)
+        torch.testing.assert_close(compiled(x, y), fn(x, y))
+    assert REPORTS, "应当留下回退记录"
+    assert all(not r.fused for r in REPORTS.values())
+    assert any(("符号" in r.reason or "动态" in r.reason or "SymInt" in r.reason)
+               for r in REPORTS.values())
+
+
+# ---------------------------------------------------------------------------
+# F8：explain 必须返回「被问的那个对象」的结论，而不是随便 REPORTS 里的第一条。
+# ---------------------------------------------------------------------------
+
+def test_explain_attributes_report_to_the_compiled_object():
+    from gkern.torch_ext.backend import REPORTS, explain, gkern_backend
+    torch._dynamo.reset()
+    REPORTS.clear()
+    fused_fn = lambda x: torch.sigmoid(x) * 2.0          # 纯逐元素 → 融合
+    fallback_fn = lambda x, y: torch.sin(x) + y          # sin 不认识 → 回退
+    cf = torch.compile(fused_fn, backend=gkern_backend, fullgraph=True, dynamic=False)
+    cb = torch.compile(fallback_fn, backend=gkern_backend, fullgraph=True, dynamic=False)
+    cf(torch.randn(31))
+    cb(torch.randn(31), torch.randn(31))
+
+    rep_f = explain(cf)
+    rep_b = explain(cb)
+    assert rep_f["fused"] is True
+    assert rep_b["fused"] is False
+    assert "sin" in rep_b["reason"]
+
+
+def test_explain_without_argument_reports_latest_compile():
+    from gkern.torch_ext.backend import REPORTS, explain, gkern_backend
+    torch._dynamo.reset()
+    REPORTS.clear()
+    assert explain()["fused"] is None
+    fn = lambda x: torch.sigmoid(x) * 2.0
+    torch.compile(fn, backend=gkern_backend, fullgraph=True, dynamic=False)(torch.randn(9))
+    latest = explain()
+    assert latest["fused"] is True
+
+
+def test_explain_latest_is_recent_compile_not_first_inserted_key():
+    """回归：``torch._dynamo.reset()`` 之后 CompileId 会从 ``0/0`` 重新分配。
+
+    重编译同一个帧是**原地覆盖**旧 key，所以 dict 的插入位置仍停在最前面；
+    若把「最新」实现成「插入顺序里的最后一个」，就会一直回答第一次编译的
+    结论。这里先融合再回退，正确答案是回退。
+    """
+    from gkern.torch_ext.backend import REPORTS, explain, gkern_backend
+    torch._dynamo.reset()
+    REPORTS.clear()
+    fn = lambda x: torch.sigmoid(x) * 2.0
+    cf = torch.compile(fn, backend=gkern_backend, fullgraph=True, dynamic=False)
+    cf(torch.randn(31))                            # float32 → 融合
+    assert explain()["fused"] is True
+    cf(torch.randn(31, dtype=torch.float64))       # dtype 变 → 重编译 → 回退
+    assert list(REPORTS) == ["0/0", "0/1"], list(REPORTS)
+    assert explain()["fused"] is False
+    assert "float32" in explain()["reason"]
+    assert explain(cf)["fused"] is False
+    assert "float32" in explain(cf)["reason"]

@@ -76,12 +76,28 @@ def _op_name(node: fx.Node) -> str:
     return text
 
 
+def _is_symbolic(dim: Any) -> bool:
+    """维度是不是符号值（``torch.SymInt``）。"""
+    return isinstance(dim, torch.SymInt)
+
+
 def try_lower(gm: fx.GraphModule, example_inputs) -> Callable:
     """成功返回可调用的融合实现；接不住就抛 :class:`UnsupportedGraph` 说明原因。"""
     placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
     if not placeholders:
         raise UnsupportedGraph("图里没有输入占位符")
     tensors = [a for a in example_inputs if isinstance(a, torch.Tensor)]
+
+    # Dynamo 在 dynamic=True 时会把形状符号作为额外占位符塞进图里（SymInt），
+    # 此时「张量数 != 占位符数」。如果只说数量对不上，用户根本看不出是动态
+    # 形状导致的 —— 所以先点名 SymInt，再说数量。
+    sym_placeholders = sorted(
+        str(a) for a in example_inputs
+        if not isinstance(a, torch.Tensor) and isinstance(a, torch.SymInt))
+    if sym_placeholders:
+        raise UnsupportedGraph(
+            f"只支持静态形状，图里含符号维度占位符 {sym_placeholders}")
+
     if len(tensors) != len(placeholders):
         raise UnsupportedGraph(
             f"张量输入数 {len(tensors)} 与占位符数 {len(placeholders)} 不一致")
@@ -93,6 +109,21 @@ def try_lower(gm: fx.GraphModule, example_inputs) -> Callable:
     if any(t.dtype != torch.float32 for t in tensors):
         raise UnsupportedGraph(
             f"只支持 float32，收到 {sorted({str(t.dtype) for t in tensors})}")
+
+    # 非 CPU 设备必须先拒：runner 走 numpy，meta 张量根本没有数据，
+    # 硬接会在 runner 里抛出一个和「下沉失败」无关的 TypeError。
+    off_device = sorted({str(t.device.type) for t in tensors if t.device.type != "cpu"})
+    if off_device:
+        raise UnsupportedGraph(
+            f"只支持 CPU 张量（runner 经 numpy 计算），收到设备 {off_device}")
+
+    # 动态/符号形状回退：numel 与 grid 都要在编译期算成常量，符号维度算不出来；
+    # 不做显式判断就会在 _build_runner 里抛 GuardOnDataDependentSymNode，
+    # 那是个「下沉失败」之外的错误类型，Dynamo 侧无法按回退处理。
+    symbolic = sorted({str(d) for t in tensors for d in t.shape if _is_symbolic(d)})
+    if symbolic:
+        raise UnsupportedGraph(
+            f"只支持静态形状，收到符号维度 {symbolic}（numel/grid 需编译期常量）")
 
     shape = tuple(tensors[0].shape)
     if any(tuple(t.shape) != shape for t in tensors):
