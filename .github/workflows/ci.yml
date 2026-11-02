@@ -75,6 +75,29 @@ jobs:
               assert float(b["max_error"]) > 100 * float(a["max_error"]), (a, b)
           print("smem 字节相等 / bank 992-0 / 复用上界 n=2048 compute / bf16 误差与字节 均通过")
           PY
+      - name: Assert the scheduling accounting (waves, stream-K partition, recommendations)
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          data = json.loads(pathlib.Path("benchmarks/results/bench.json").read_text())
+          rows = data["schedule"]
+          by = {(r["shape"], r["strategy"]): r for r in rows}
+          tail = "1280x1280x528 (tail)"
+          deep = "256x256x8192 (deep-K)"
+          # persistent 治不了 tail：与 naive 的利用率必须完全相同
+          assert by[(tail, "persistent")]["efficiency"] == by[(tail, "naive")]["efficiency"], rows
+          assert by[(deep, "persistent")]["efficiency"] == by[(deep, "naive")]["efficiency"], rows
+          # 深 K 小输出的 naive 只有 4 个单元铺 40 个槽
+          assert by[(deep, "naive")]["efficiency"] == 0.1, by[(deep, "naive")]
+          # 结论随形状翻转
+          verdict = {v["shape"]: v["best"] for v in data["schedule_verdict"]}
+          assert verdict[tail] == "split-k" and verdict[deep] == "stream-k", verdict
+          # 部分和份数必须来自真实划分，且不可能超过 worker 边界数
+          for row in rows:
+              if row["strategy"] == "stream-k":
+                  assert 0 <= row["partial_cuts"] <= 39, row
+          print("调度账通过：persistent==naive / naive(deep)=0.1 / 推荐 split-k 与 stream-k / 部分和 <= 39")
+          PY
       - name: Assert the fusion byte equality still holds
         run: |
           python - <<'PY'

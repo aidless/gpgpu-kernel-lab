@@ -42,14 +42,14 @@
 ```bash
 cd gpgpu-kernel-lab
 # 方式 A（推荐，避免 PEP 668 externally-managed 报错）：源码直跑，不安装
-PYTHONPATH=src python3 -m pytest            # 134 个用例通过（含 C++ 扩展；未构建扩展时 112 passed + 1 模块级 skip）
+PYTHONPATH=src python3 -m pytest            # 154 个用例通过（含 C++ 扩展；未构建扩展时 132 passed + 1 模块级 skip）
 PYTHONPATH=src python3 examples/quickstart.py
 PYTHONPATH=src python3 benchmarks/run_benchmarks.py
 
 # 方式 B（正常 venv 内）：editable 安装后直接 pytest
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"                       # numpy + torch + pytest（可再加 pybind11）
-pytest                                        # 同上 134 个用例
+pytest                                        # 同上 154 个用例
 ```
 
 2026-11-01 实测：宿主机是 PEP 668 externally-managed（`pip install -e .` 被拒），
@@ -255,7 +255,50 @@ softmax 在四个位置降精度（输入、行最大值、指数结果、归约
 
 ---
 
-## 开发中实际踩到并修掉的十个坑
+**工作分解：tail 值钱，但只有把工作切细才治得了它**
+
+矩阵乘在硬件上不是「一次算完」，而是把输出切成 tile 铺到 SM 上排队。100 个 tile
+铺 40 个 SM：40 + 40 + 20 —— 最后一波一半 SM 空转，整体利用率 0.83。这个账在
+`gkern/schedule/` 里是可复算的整数，不是直觉（数字来自 `benchmarks/results/bench.md`）：
+
+| 形状 | 策略 | 单元数 | 波次 | 利用率 | 边界部分和 | 额外流量 (B) | 预测 (ms) |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1280×1280×528 | naive | 100 | 3 | 0.8333 | 0 | 0 | 0.255034 |
+| 1280×1280×528 | split-K(2) | 200 | 5 | 1.0000 | 200 | 26214400 | 0.212528 |
+| 1280×1280×528 | stream-K | 3300 | 83 | 0.9940 | 39 | 5111808 | 0.213816 |
+| 1280×1280×528 | persistent | 100 | 3 | 0.8333 | 0 | 0 | 0.255034 |
+| 256×256×8192 | naive | 4 | 1 | 0.1000 | 0 | 0 | 1.318964 |
+| 256×256×8192 | split-K(16) | 64 | 2 | 0.8000 | 64 | 8388608 | 0.164870 |
+| 256×256×8192 | stream-K | 2048 | 52 | 0.9846 | 39 | 5111808 | 0.133957 |
+| 256×256×8192 | persistent | 4 | 1 | 0.1000 | 0 | 0 | 1.318964 |
+
+四条结论，每条都能从上表读出：
+
+1. **persistent 治不了 tail**：它和 naive 的波指标**完全一样**（0.8333 / 0.1000）。
+   常驻块省的是块调度开销，而 tail 是并行度用不满——换谁派发都一样。这一栏留在表里
+   就是为了把这个常见误解钉死。
+2. **split-K 在宽扁大矩阵上几乎免费**：额外流量 26 MB 看着吓人，但同一形状的计算
+   时间是 0.21 ms，26 MB 在 320 GB/s 下只要 0.08 ms——被计算盖住，而利用率从
+   0.83 提到 1.00。所以它在这个形状上赢。
+3. **stream-K 在「输出极小、K 极深」时翻盘**：256×256 的输出只有 4 个 tile，
+   naive 利用率 0.1（40 个槽里 36 个空着）；stream-K 以 k-iter 为单元把粒度细 512 倍，
+   利用率 0.98，且只在 39 个跨 worker 边界落部分和（5.1 MB），比 split-K×16 的
+   8.4 MB 还少。
+4. **同一套模型给出不同推荐**：`recommend()` 在 1280³ 上选 split-K、在 256×256×8192
+   上选 stream-K。这是它有用处的证据——如果两个形状都给同一个答案，这套模型就该删。
+
+「边界部分和」那一列**不是闭式公式算的**：`streamk_units()` 把 3300 / 2048 次 k-迭代
+真的切成连续区间（分别 139 / 43 段），再从划分里数出「哪些 tile 被多个 worker 累加」。
+闭式 `capacity−1 = 39` 只是上界，本机两个形状恰好都等于 39——凑巧相等不算数，
+所以测试断言的是「两套账必须一致」，一旦划分改了而表里的数没改，闸就红。
+
+诚实边界：`predicted_ms` 只含「计算 ÷ 利用率」与「字节 ÷ 带宽」两项，
+不含发射延迟、占用率爬坡、L2 命中（见 `docs/ARCHITECTURE.md` §8.2 的缺口清单）。
+它能在策略之间排序，不能预测墙钟。
+
+---
+
+## 开发中实际踩到并修掉的十一个坑
 
 每一条都是**先有失败的症状、再定位根因**，不是事后编的故事：
 
@@ -304,15 +347,26 @@ softmax 在四个位置降精度（输入、行最大值、指数结果、归约
    （`rm2 * K + rk_r`，int64）也被算成浮点运算：n=1024 的算术强度从 176.0 虚高到
    184.5，roofline 判定跟着漂。修法：只对浮点 dtype 的节点计 FLOP。
 
+11. **`from ..compiler import run` 拿到的是「编译并跑」，不是「跑一个 Program」**
+   （`ops/online_softmax.py`）。把已经编译好的 `Program` 传进去，报的是
+   `TypeError: Program(online_softmax_rows, instrs=118, grid=(4,)) is not a callable
+   object` —— 报错指向 `inspect`，离真正的原因隔了两层。正确的入口是
+   `compiler.codegen.run(program, buffers)`，两者同名不同义。
+   这类「同名不同义」的坑比逻辑错更难查：它不产生错误数值，只在调用方式上设一道坎。
+
 ---
 
 ## 测试与自检闸
 
 ```bash
-PYTHONPATH=src python3 -m pytest              # 134 passed（含 C++ 扩展；未构建扩展时 112 passed + 1 个模块级 skip）
+PYTHONPATH=src python3 -m pytest              # 154 passed（含 C++ 扩展；未构建扩展时 132 passed + 1 个模块级 skip）
 PYTHONPATH=src python3 scripts/verify_numbers.py            # 重算文档里每个数字
 PYTHONPATH=src python3 scripts/verify_numbers.py --selftest # 证明这个闸会红
 ```
+
+仓库现有 **135 个测试函数**（含 C++ 扩展时 pytest 收集 154 条用例；未构建扩展时
+132 passed + 1 个模块级 skip）。这个「函数个数」被 `verify_numbers.py` 当断言盯着——
+用例数会随可选扩展变，函数个数不会，所以拿它做机器无关的文档闸。
 
 `scripts/verify_numbers.py` 是「文档数字会漂移」这个问题的可执行对策：它把
 README/文档里出现的每个数值（26.2144 TFLOPS、102.4 GB/s、64/2048 事务、
@@ -337,6 +391,12 @@ README/文档里出现的每个数值（26.2144 TFLOPS、102.4 GB/s、64/2048 �
 - `tests/test_mixed_precision.py`：`round_bf16` 与 `torch.bfloat16` 的**位模式级**一致
   （含 tie-to-even 与 NaN/Inf）、bf16 累加的误差比 fp32 大 100 倍以上、
   两条路径的访存字节完全相同而 FLOP 只多四次舍入。
+- `tests/test_online_softmax.py`：分块在线 softmax 与两遍扫描**数值一致**、
+  尾块（1000 列 / 块 256）行和为 1、大偏移不发散，以及字节账
+  **差恰好等于一整遍输入**（`4×512×4` 字节）——省的是确定的流量，不是玄学。
+- `tests/test_schedule.py`：波量化（100 单元铺 40 槽 → 3 波、最后一波空 20 槽）、
+  四种分解的单元数与额外流量，以及**结论随形状翻转**（宽扁大矩阵推荐 split-K，
+  输出极小 K 极深推荐 stream-K）。
 - `tests/test_package.py`：公开 API 契约（`from gkern.torch_ext import register_backend`
   必须真的可用——这个包曾一度缺 `__init__.py`，`import gkern` 正常但公开名字导入失败）。
 
@@ -354,15 +414,19 @@ README/文档里出现的每个数值（26.2144 TFLOPS、102.4 GB/s、64/2048 �
       n=2048 首次判为 compute；同时证明 smem 本身不改 HBM 字节）
 - [x] `PrivateUse1` 设备后端骨架（设备对象与查询函数接上，分配器 / kernel 缺口清单化）
 - [x] 云端 GPU 实测 + 代价模型对账（T4：`docs/cloud-reconciliation.md`）
+- [x] 分块在线 softmax（输入只读一遍，字节账差恰好一整遍输入）
+- [x] 调度层：波量化 + naive / split-K / stream-K / persistent 四种分解的账与推荐
+- [x] C++ 第二实现（pybind11，跨语言语义差用 `floor_div` 钉住）+ bf16 混合精度
 - [ ] 真实国产卡上的算子对拍（等算力到位后，把「模拟」换成「实测」）
 
 ## 延伸阅读
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)：三档保真度、IR 为什么是线性指令表、融合不变量的边界、三个扩展点。
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)：三档保真度、IR 为什么是线性指令表、融合不变量的边界、代价模型的两个口径、调度层的波量化与工作分解。
 - [docs/jd-mapping.md](docs/jd-mapping.md)：招聘要求 ↔ 本仓库可运行证据逐条对照，**含三个必须承认的缺口**。
 - [docs/ecosystem.md](docs/ecosystem.md)：正表 30 行 / 28 个唯一仓库，附表 21 行 / 相对正表新增 19 个，全文 51 行 / 47 个唯一仓库（全部 2026-10-31 用 GitHub API 复核）逐个用 GitHub API 验真，含源码入口级阅读路径与失效路径说明。
 - [docs/cloud-reconciliation.md](docs/cloud-reconciliation.md)：唯一的硬件实测证据（T4）与代价模型的对账，含「手写 softmax 没赢过 eager」这条不舒服的结论。
 - [docs/domestic-card-notes.md](docs/domestic-card-notes.md)：国产卡（昇腾/vllm-ascend）与 CUDA 侧的 attention 源码对照，逐条判定本仓库哪几条建模假设在 NPU 上直接失效。
+- [docs/papers.md](docs/papers.md)：8 篇论文的文献地图（在线 softmax / GEMM 分解 / 融合 / 代价模型），每篇都标了「能落成本仓库哪个模块的什么改动」与「我们不做的那部分」。
 - [benchmarks/results/bench.md](benchmarks/results/bench.md)：最近一次基准输出（数值墙钟 × 模型预测 × 受限类型 × 融合等式）。
 
 ## 许可证

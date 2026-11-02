@@ -222,3 +222,48 @@ bank 冲突必须**按 warp 分组**统计。硬件一次发射的最小单位�
 这里也踩过一个记账坑：我以为「四次舍入 × 元素数」，实测只多 `2*numel + 2*rows`——
 行最大值与归约和是 `shape=(1,)` 的标量 tile，每个 program 一个。**记账必须按 IR 里真实
 存在的 tile 算，不能按「我以为有几次舍入」算。**
+
+## 11. 调度层：波量化与工作分解（`gkern/schedule/`）
+
+`costmodel` 回答「这个 kernel 必须搬多少字节、多少 FLOP」，`schedule` 回答另一个问题：
+**这些工作怎么摊到 SM 上，最后一波浪费了多少并行度**。两者都不含 cache 与发射开销，
+合起来只承诺「可比的下界」，不承诺墙钟（缺口清单见 §8.2）。
+
+### 11.1 波量化是一个除法，不是一个形容词
+
+`wave_stats(units, capacity)` 只有三个量：`capacity = sm_count × blocks_per_sm`、
+`waves = ceil(units / capacity)`、`eff = units / (waves × capacity)`。
+100 个 tile 铺 40 个槽：`40+40+20`，最后一波空 20 个槽，效率 `100/120 = 0.8333`。
+`tests/test_schedule.py` 用整数断言钉住（3 波、最后一波 20 个、效率 100/120），
+因为这类数字一旦变成散文描述就没人能复核。
+
+### 11.2 四种分解的差别只在两笔账上
+
+单元粒度决定 tail，边界决定额外流量：
+
+| 策略 | 单元 | tail | 额外流量 |
+|---|---|---|---|
+| naive | `tiles` | 按 tile 剩 | 0 |
+| split-K(σ) | `tiles×σ` | 按 tile 剩 | 每 tile 每 split 一份部分和（写+读） |
+| stream-K | `tiles×k_iters` | 按 k-iter 剩（细 33～512 倍） | 只有落在 tile 内部的边界 |
+| persistent | `tiles` | **与 naive 完全相同** | 0 |
+
+最后一行是这层最该记住的结论：**persistent 治的是块调度开销，不是负载均衡**。
+把它当成「tail 的解法」会在 256×256×8192 这种形状上得出完全错误的选择（naive/persistent
+利用率 0.1，stream-K 0.9846）。
+
+### 11.3 部分和份数必须从划分里数出来
+
+`streamk_units()` 把 `iter_units` 次迭代连续切给 `capacity` 个 worker，返回每段的
+`(worker, tile, k_start, k_end)`。两条不变量：**迭代总数守恒**（`sum(k_end-k_start) == iter_units`）、
+**每个 tile 的区间首尾相接**。部分和份数 `streamk_partials()` 是「每个 tile 上多出来的 worker 数」之和——
+不是闭式 `capacity−1`：只有落在 tile 内部的边界才要落部分和，对齐到 tile 边界的切分不用。
+本机两个形状恰好都等于 39，**凑巧相等不能当公式用**，所以 `scripts/verify_numbers.py` 里
+断言的是「模型里的数 == 划分里数出来的数」，任何一边单独改动都会让闸变红。
+
+### 11.4 结论随形状翻转，否则这层就该删
+
+`recommend()` 在 1280×1280×528 上选 split-K（额外 26 MB 被 0.21 ms 的计算时间盖住，
+利用率 0.83→1.00），在 256×256×8192 上选 stream-K（naive 只有 4 个单元铺 40 个槽）。
+两个形状给同一个答案就说明这套模型没有分辨力——`tests/test_schedule.py` 与
+`verify_numbers.py` 各有一条断言钉住这两种推荐。

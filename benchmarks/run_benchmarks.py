@@ -22,8 +22,10 @@ import time
 import numpy as np
 
 from gkern.compiler import compile_kernel, costmodel
+from gkern.gpgpu.device import DeviceInfo
 from gkern.ops import (matmul, precision_summary, run_fused_mlp, run_matmul,
                        run_smem_column, run_softmax, run_vector_add)
+from gkern.schedule import GemmShape, compare_strategies
 
 OUT_DIR = pathlib.Path(__file__).resolve().parent / "results"
 
@@ -177,11 +179,28 @@ def main() -> None:
                                    "bytes": row["bytes"], "flops": row["flops"],
                                    **row})
 
+    # 工作分解：同一套模型在两种形状上给出不同推荐——宽扁大矩阵 vs 输出极小 K 极深
+    schedule_rows = []
+    schedule_verdicts = []
+    t4 = DeviceInfo.tesla_t4()
+    for label, shape, splits in (
+        ("1280x1280x528 (tail)", GemmShape(1280, 1280, 528, 128, 128, 16), 2),
+        ("256x256x8192 (deep-K)", GemmShape(256, 256, 8192, 128, 128, 16), 16),
+    ):
+        rows_by_strategy = compare_strategies(shape, t4, splits=splits)
+        best = min(rows_by_strategy.values(), key=lambda r: r["predicted_ms"])["strategy"]
+        schedule_verdicts.append({"shape": label, "splits": splits, "tiles": shape.tiles,
+                                  "iter_units": shape.iter_units, "best": best})
+        for row in rows_by_strategy.values():
+            schedule_rows.append({"shape": label, "tiles": shape.tiles,
+                                  "iter_units": shape.iter_units, **row})
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     (OUT_DIR / "bench.json").write_text(
         json.dumps({"kernels": rows, "fusion": fusion_rows, "smem": smem_rows,
                     "bank": bank_rows, "reuse": reuse_rows,
-                    "precision": precision_rows},
+                    "precision": precision_rows, "schedule": schedule_rows,
+                    "schedule_verdict": schedule_verdicts},
                    indent=2, ensure_ascii=False),
         encoding="utf-8")
 
@@ -221,6 +240,16 @@ def main() -> None:
     for r in precision_rows:
         lines.append(f"| {r['shape']} | {r['accumulate']} | {r['max_error']} | "
                      f"{r['mean_error']} | {r['bytes']} | {r['flops']} |")
+    lines.append("")
+    lines.append("| 形状 | 策略 | 单元数 | 波次 | 利用率 | 边界部分和 | 额外流量 (B) | 预测 (ms) |")
+    lines.append("|---|---|---:|---:|---:|---:|---:|---:|")
+    for r in schedule_rows:
+        lines.append(f"| {r['shape']} | {r['strategy']} | {r['units']} | {r['waves']} | "
+                     f"{r['efficiency']:.4f} | {r['partial_cuts']} | {r['extra_bytes']} | "
+                     f"{r['predicted_ms']} |")
+    lines.append("")
+    lines.append("推荐（按模型时间）：" + "；".join(
+        f"{v['shape']} → {v['best']}（splits={v['splits']}）" for v in schedule_verdicts))
     table = "\n".join(lines)
     (OUT_DIR / "bench.md").write_text(table + "\n", encoding="utf-8")
     print(table)

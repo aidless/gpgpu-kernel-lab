@@ -53,6 +53,16 @@ EXPECTED = {
     "bf16_round_tie_down": 1.0,
     "bf16_round_tie_up": 1.015625,
     "bf16_error_ratio_floor": 10000,
+    "schedule_tiles_a": 100,
+    "schedule_iter_units_a": 3300,
+    "schedule_naive_efficiency_a": 0.833333,
+    "schedule_stream_k_extra_a": 5111808,
+    "schedule_split_k_extra_a": 26214400,
+    "schedule_naive_efficiency_b": 0.1,
+    "schedule_best_a": "split-k",
+    "schedule_best_b": "stream-k",
+    "streamk_segments_a": 139,
+    "streamk_segments_b": 43,
 }
 
 failures: list[str] = []
@@ -233,6 +243,52 @@ _p16 = _prec(_x16, accumulate="bf16")
 check("precision_bytes_equal", _p16.cost.bytes_total == _p32.cost.bytes_total, True)
 check("precision_error_ratio_floor",
       bool(_p16.max_error / _p32.max_error > EXPECTED["bf16_error_ratio_floor"]), True)
+
+# 4f. 工作分解：波量化与四种策略的账（结论必须随形状翻转）
+from gkern.schedule import GemmShape as _GS, compare_strategies as _cmp  # noqa: E402
+from gkern.schedule import recommend as _recommend  # noqa: E402
+
+_t4 = DeviceInfo.tesla_t4()
+_shape_a = _GS(M=1280, N=1280, K=528, bm=128, bn=128, bk=16)
+_shape_b = _GS(M=256, N=256, K=8192, bm=128, bn=128, bk=16)
+_rows_a = _cmp(_shape_a, _t4, splits=2)
+_rows_b = _cmp(_shape_b, _t4, splits=16)
+
+check("schedule_tiles_a", _shape_a.tiles, EXPECTED["schedule_tiles_a"])
+check("schedule_iter_units_a", _shape_a.iter_units, EXPECTED["schedule_iter_units_a"])
+check("schedule_naive_efficiency_a", round(_rows_a["naive"]["efficiency"], 6),
+      EXPECTED["schedule_naive_efficiency_a"])
+check("schedule_naive_efficiency_b", round(_rows_b["naive"]["efficiency"], 6),
+      EXPECTED["schedule_naive_efficiency_b"])
+check("schedule_stream_k_extra_a", _rows_a["stream-k"]["extra_bytes"],
+      EXPECTED["schedule_stream_k_extra_a"])
+check("schedule_split_k_extra_a", _rows_a["split-k"]["extra_bytes"],
+      EXPECTED["schedule_split_k_extra_a"])
+# 只有在边界落部分和，才可能少于「每 tile 每 split 一份」
+check("stream_k_cuts_fewer_than_split_k_partials",
+      _rows_a["stream-k"]["partial_cuts"] < _rows_a["split-k"]["partial_cuts"], True)
+# persistent 在本模型里治不了 tail——与 naive 完全一致，这是诚实的边界
+check("persistent_equals_naive_on_waves",
+      _rows_a["persistent"]["efficiency"] == _rows_a["naive"]["efficiency"], True)
+from gkern.schedule import streamk_partials as _skp  # noqa: E402
+from gkern.schedule import streamk_units as _sku  # noqa: E402
+
+_units_a = _sku(_shape_a, _t4)
+_units_b = _sku(_shape_b, _t4)
+check("streamk_segments_a", len(_units_a), EXPECTED["streamk_segments_a"])
+check("streamk_segments_b", len(_units_b), EXPECTED["streamk_segments_b"])
+# 划分必须是工作量的分割：迭代总数守恒，否则「切细了」只是把活漏掉
+check("streamk_iters_conserved_a",
+      sum(u.k_end - u.k_start for u in _units_a), _shape_a.iter_units)
+check("streamk_iters_conserved_b",
+      sum(u.k_end - u.k_start for u in _units_b), _shape_b.iter_units)
+# 部分和份数必须与真实划分一致（闭式 capacity-1 只是上界，凑巧相等不算数）
+check("streamk_partials_match_partition_a",
+      _rows_a["stream-k"]["partial_cuts"], _skp(_shape_a, _t4))
+check("streamk_partials_match_partition_b",
+      _rows_b["stream-k"]["partial_cuts"], _skp(_shape_b, _t4))
+check("schedule_best_a", _recommend(_shape_a, _t4, splits=2), EXPECTED["schedule_best_a"])
+check("schedule_best_b", _recommend(_shape_b, _t4, splits=16), EXPECTED["schedule_best_b"])
 
 # 5. 事务计数函数本身的 128B 分段语义（防「计数尺」漂移）
 check("count_transactions_128B_split",
