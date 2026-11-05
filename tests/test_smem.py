@@ -101,16 +101,15 @@ def test_reuse_bound_is_strictly_below_global_lower_bound():
 
 
 def test_tile_growth_alone_cannot_cross_the_crossover():
-    """把 tile 从 16 加到 128，AI 只从 4.3 涨到 29.6——离 256 还差一个数量级。
-
-    这是「路线图里「加共享内存分块就能翻成 compute」这个说法不成立」的量化依据。
-    """
+    """n=512 时 tile 16→128 的算术强度是 4.0615→29.3333，离交叉点 256 还差一个数量级。"""
     ai = []
     for tile in (16, 32, 64, 128):
         prog = _matmul_program(512, bm=tile, bn=tile)
         ai.append(costmodel.analyze(prog).arithmetic_intensity)
         assert costmodel.analyze(prog).bound == "memory"
     assert ai == sorted(ai)
+    assert round(ai[0], 4) == 4.0615
+    assert round(ai[-1], 4) == 29.3333
     assert ai[-1] < 40.0
 
 

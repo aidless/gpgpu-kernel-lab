@@ -132,38 +132,37 @@
 
 ### E.1 两条先立好的口径（写任务卡前必须钉死）
 
-**口径 1：CPU 教学模型不许宣称 GFLOPS 实绩。** `gkern` 是纯 CPU 的解析/模拟模型（`src/gkern/compiler/costmodel.py` 用 `DeviceInfo` 的 SM 数 × FP32 核 × 2 × 频率算 `peak_flops_tflops`，默认 `generic-domestic-gpgpu` 得 26.2144 TFLOPS；带宽 102.4 GB/s、roofline 交叉点 256.0 FLOP/B 全是**假设参数**，不是真卡）。本机实测：无 `nvidia-smi`、无 `nvcc`，`torch 2.14.1+cu130` 但 `torch.cuda.is_available()=False`，`triton 3.8.0` 无 GPU driver（报 `0 active drivers`）。所以：
+**口径 1：CPU 模型不许宣称设备吞吐。** `gkern` 的默认 `DeviceInfo` 给出 26.2144 TFLOPS、102.4 GB/s、交叉点 256.0 FLOP/B，全是假设参数，不是某张卡的实测。`scripts/offline_cpu.sh` 不跑 GPU。所以：
 
-- 允许说：「模型预测 X 微秒」「算术强度 Y FLOP/B」「受限类型 memory」「访存事务数 / 合并效率 / bank 冲突度」。
-- **禁止**说：「优化后达到 N GFLOPS」「比 baseline 快 N 倍」「实测吞吐」——除非该数字来自云 GPU 上的真实 Triton/CUDA 运行。
-- 真实 GPU 数字一律放云上跑并贴原始输出：Kaggle GPU 通道可用，`kaggle quota` 实测 2026-10-31 剩 **8.43 h（30 h/周配额，2026-11-07 刷新）**，CPU 侧只做编排与解析。
+- 允许说：「模型预测 X 微秒」「算术强度 Y FLOP/B」「受限类型 memory」「访存事务数 / 合并效率 / bank 冲突度」，并标明这是 OBSERVED (CPU)。
+- **禁止**说：「优化后达到 N GFLOPS」「比 baseline 快 N 倍」「实测吞吐」。树里那份 T4 softmax JSON 是归档，离线路径不重跑，不能拿来填 UNKNOWN。
 
-**口径 2：`torch.compile` backend ≠ PrivateUse1 设备后端。** `src/gkern/torch_ext/backend.py` 里的 `gkern_backend(gm, example_inputs)` 经 `torch._dynamo.register_backend(name="gkern", ...)` 注册，它是 **Dynamo 的图编译器后端**：吃一个 `fx.GraphModule`、吐一个 callable，算子仍然落在 CPU 上执行，靠 `fx_lower.try_lower` 把纯逐元素图换成融合实现、不支持就回退 eager。它**没有**注册任何新设备。注册一个 `PrivateUse1` 设备后端是另一套 API（`torch.utils.backend_registration.rename_privateuse1_backend` + `generate_methods_for_privateuse1_backend`，本机 torch 2.14.1 实测就暴露这两个），需要你自己提供 allocator / stream / event / 生成器，让 `torch.empty(..., device="gkern")` 真能跑。两者互不替代：
+**口径 2：`torch.compile` backend ≠ PrivateUse1 设备后端。** `src/gkern/torch_ext/backend.py` 里的 `gkern_backend(gm, example_inputs)` 经 `torch._dynamo.register_backend(name="gkern", ...)` 注册，它是 **Dynamo 的图编译器后端**：吃一个 `fx.GraphModule`、吐一个 callable，算子仍然落在 CPU 上执行，靠 `fx_lower.try_lower` 把纯逐元素图换成融合实现、不支持就回退 eager。它**没有**注册任何新设备。注册一个 `PrivateUse1` 设备后端是另一套 API（`torch.utils.backend_registration.rename_privateuse1_backend` + `generate_methods_for_privateuse1_backend`），需要你自己提供 allocator / stream / event / 生成器，让 `torch.empty(..., device="gkern")` 真能跑。两者互不替代：
 
-| 维度 | `torch.compile` backend（`backend.py` 现状） | PrivateUse1 设备后端（尚未实现） |
+| 维度 | `torch.compile` backend（`backend.py` 现状） | PrivateUse1 设备后端（骨架；分配器未接） |
 |---|---|---|
 | 注册 API | `torch._dynamo.register_backend(name=..., compiler_fn=...)` | `torch.utils.backend_registration.rename_privateuse1_backend(name)` + `generate_methods_for_privateuse1_backend()` |
 | 输入/输出 | 输入 `fx.GraphModule`+`example_inputs`，输出 callable | 提供设备工厂、allocator、stream/event、RNG 等，让 tensor 能落在新 device 上 |
 | 作用面 | 只接管「图 → 代码」这一层 | 接管「设备 → 存储/执行」这一层 |
-| 现状 | 已实现、`tests/test_torch_ext.py` 有覆盖 | 本项目未实现；这类实现在树外仓库里（如 `Ascend/pytorch` 的 `torch_npu/csrc/`），`pytorch/pytorch` 主线本身无 `torch/npu`（实测 404） |
+| 现状 | 已实现、`tests/test_torch_ext.py` 有覆盖 | 设备名能注册，`torch.empty(..., device="gkern")` 仍是 `NotImplementedError`（`device_backend.GAPS`）。完整分配器在树外仓库里（如 `Ascend/pytorch` 的 `torch_npu/csrc/`） |
 
 ### E.2 四周项目任务卡（每天 2–3 小时；每周有可验收产出）
 
 **第 1 周｜把「读数能力」落到 CPU 模型上（0 GPU）**
-- 目标：让 `costmodel.py` 的 roofline 输出能对上 `benchmarks/` 的算术强度实测，并写出「模型假设 vs 实测」的边界。
+- 目标：让 `costmodel.py` 的 roofline 输出能对上 `benchmarks/` 的算术强度（模型输出，不是设备吞吐），并写出「模型假设 vs 硬件未知项」的边界。
 - 读点（本表第 2、3、4 行）：`NVIDIA/cuda-samples` → `cpp/6_Performance`、`siboehm/SGEMM_CUDA` → `src/kernels/1_naive.cuh`…`5_kernel_2D_blocktiling.cuh`、`feifeibear/LLMRoofline` → `hardware_dict.py`。
 - 改哪个文件：`src/gkern/compiler/costmodel.py`（对齐 roofline 输出）、`benchmarks/run_benchmarks.py`（补 matmul tile=16/32/64 的算术强度列）、`docs/ARCHITECTURE.md`（加一节「模型假设 vs 实测」）。
 - 跑什么命令：`PYTHONPATH=src python3 benchmarks/run_benchmarks.py` 与 `PYTHONPATH=src python3 scripts/verify_numbers.py`。
-- 验收：`benchmarks/results/bench.md` 里 matmul 256×256 的三档 tile 均判定为 memory-bound，且算术强度随 tile 单调升（当前实测 4.27→8.03→14.93）；`verify_numbers.py` 全绿（含 `doc_test_count`：文档里的测试数必须与真实收集数一致）。产出里不许出现任何 GFLOPS 词。
+- 验收：`benchmarks/results/bench.json` 里 matmul 256×256 的三档 tile 均判定为 memory-bound，且算术强度随 tile 单调升。数字以该 JSON 为准，由 `scripts/inventory.py` 对 `run_benchmarks.py` 重算，不在这里另抄一份。`verify_numbers.py` 全绿。产出里不许把模型输出说成设备吞吐。
 - 需不需要真实卡：不需要，纯 CPU。
 
 **第 2 周｜真实 Triton 算子 + 云 GPU 实测（必须上云）**
 - 目标：把「只在 CPU 上算 roofline」升级成「同一个 softmax 在真 GPU 上有实测 ms/GB/s」，拿到第一份可以对外说的真卡数字。
 - 读点（本表第 1 行）：`triton-lang/triton` → `python/tutorials/02-fused-softmax.py`（照抄它的 `do_bench` 用法，不要自己造计时器）。
-- 改哪个文件：新建 `benchmarks/triton/softmax_bench.py`（照 `triton-lang/triton` → `python/tutorials/02-fused-softmax.py` 改，保留 `triton.testing.do_bench`）、`docs/ARCHITECTURE.md` 记一条实测。
-- 跑什么命令：本地先 `PYTHONPATH=src python3 -m py_compile benchmarks/triton/softmax_bench.py` 过语法；再在 Kaggle GPU kernel 里 `python benchmarks/triton/softmax_bench.py`（Kaggle 的 notebook 用 `!python ...`，working dir 需 `%cd` 到仓库根）。
-- 验收：贴出 GPU 型号、`nvidia-smi` 输出、`BLOCK_SIZE ∈ {1024,2048,4096,8192}` 的 `ms` 与 `GB/s` 实测四项（**必须同时记录 shape 与 dtype，否则数字无法复算**）；与 PyTorch eager softmax 同 shape 对比，给出「Triton vs eager」倍数并注明测量环境。**这批数字是唯一可以对外说的真卡带宽/吞吐数据；没跑过就不许写。**
-- 需不需要真实卡：**需要**，云 GPU（Kaggle T4/P100，实测 2026-10-31 配额剩 8.43 h）；本机无 CUDA，跑不了。
+- 改哪个文件：`benchmarks/triton/bench_softmax_triton.py`（保留 `triton.testing.do_bench`）。没有 CUDA 时脚本退出，不写 JSON。
+- 跑什么命令：离线机器不要跑它。`scripts/offline_cpu.sh` 不包含这一步。真有 GPU 时才 `python benchmarks/triton/bench_softmax_triton.py --out triton_softmax.json`，并把原文件放进 `benchmarks/results/`。
+- 验收：结果文件要带 GPU 型号、shape、dtype、`ms` 与 `GB/s`。没跑过就不许把数写进 README 的 OBSERVED 表。仓库里现有的 `triton_softmax_t4.json` 是归档，不是这条验收的替代品。
+- 需不需要真实卡：**需要**。没有卡时这一格保持 UNKNOWN。
 
 **第 3 周｜PyTorch 适配双层走通（0 GPU，纯 CPU）**
 - 目标：把「compile backend」和「PrivateUse1 设备后端」两层分开落地——前者已有实现、后者只做诚实的缺口清单，不许混称。
@@ -183,9 +182,9 @@
 - 目标：出一份「预测 vs 实测」误差表，让 CPU 模型的假设错在哪儿变成可指认的条目，而不是一句「大致接近」。
 - 读点（本表第 3、4 行）：`NVIDIA/cuda-samples` → `cpp/6_Performance` 的 bandwidthTest 结果口径、`feifeibear/LLMRoofline` → `perf_model.py` 的 roofline 公式。
 - 改哪个文件：新建 `benchmarks/compare_model_vs_gpu.md`（表：算子 | 模型预测 µs | 云上实测 µs | 误差 % | 归因）、`src/gkern/compiler/costmodel.py` 若同一类误差系统性 >50% 就改假设并写 changelog。
-- 跑什么命令：云上跑第 2 周的 softmax_bench 取实测；本地 `PYTHONPATH=src python3 benchmarks/run_benchmarks.py` 取预测；`PYTHONPATH=src python3 scripts/verify_numbers.py` 校数字。
-- 验收：对账表三项算子齐全；误差 >50% 的行每行一句归因（写清是假设参数错还是模型缺项）；报告首行标注「预测 = CPU 解析模型，实测 = 云端 GPU，二者不可混称」。
-- 需不需要真实卡：**需要**（第 2 周同一云 GPU 通道，1 天即可）；若配额耗尽则本卡顺延并如实标注「未实测」。
+- 跑什么命令：没有 GPU 时不要写这张表。真有 GPU 才跑 `benchmarks/triton/bench_softmax_triton.py`。本地 `PYTHONPATH=src python3 benchmarks/run_benchmarks.py` 只产 CPU 预测；`scripts/verify_numbers.py` 校 CPU 数字。已有的 `triton_softmax_t4.json` 是归档，不能当作这次验收。
+- 验收：对账表三项算子齐全；误差大的行每行一句归因（写清是假设参数错还是模型缺项）；报告首行标注「预测 = CPU 解析模型，另一列 = 这次 GPU 运行，二者不可混称」。没跑 GPU 就保持 UNKNOWN，不要填数。
+- 需不需要真实卡：**需要**。没有卡时这一周没有新的 GPU 数字。
 
 > 拿不到国产卡时，D 类只读不跑：`Ascend/pytorch` 的 `torch_npu/csrc/InitNpuBindings.cpp` 与 `vllm-ascend/attention/mla_v1.py` 对照 B 节读，产出「同一 attention 在 CUDA / NPU 上的差异点」四处（分块、dtype、通信、融合），不需要卡。
 

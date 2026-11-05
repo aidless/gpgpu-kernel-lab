@@ -40,7 +40,12 @@ def timeit(fn, repeats: int = 3) -> float:
     return best * 1000.0
 
 
-def main() -> None:
+def build_report(*, time_kernels: bool) -> dict:
+    """Assemble the benchmark report.
+
+    ``time_kernels=False`` skips numpy wall clocks. Those milliseconds change
+    from machine to machine and are not a checked claim. Every other field is.
+    """
     rng = np.random.default_rng(0)
     rows = []
 
@@ -48,50 +53,53 @@ def main() -> None:
     for n in (1 << 12, 1 << 16, 1 << 18):
         x = rng.standard_normal(n).astype(np.float32)
         res = run_vector_add(x, x)
-        ms = timeit(lambda: run_vector_add(x, x))
-        rows.append({
+        row = {
             "kernel": "vector_add",
             "shape": f"({n},)",
-            "wall_ms": round(ms, 3),
             "predicted_us": round(res.cost.predicted_ms * 1000, 3),
             "bytes_total": res.cost.bytes_total,
             "flops": res.cost.flops,
             "arithmetic_intensity": round(res.cost.arithmetic_intensity, 4),
             "bound": res.cost.bound,
-        })
+        }
+        if time_kernels:
+            row["wall_ms"] = round(timeit(lambda: run_vector_add(x, x)), 3)
+        rows.append(row)
 
     # 归约：固定行数，扫描宽度（BLOCK_N 必须 ≥ N）
     for width in (64, 256, 1024):
         x = rng.standard_normal((64, width)).astype(np.float32)
         res = run_softmax(x)
-        ms = timeit(lambda: run_softmax(x))
-        rows.append({
+        row = {
             "kernel": "softmax_rows",
             "shape": f"(64, {width})",
-            "wall_ms": round(ms, 3),
             "predicted_us": round(res.cost.predicted_ms * 1000, 3),
             "bytes_total": res.cost.bytes_total,
             "flops": res.cost.flops,
             "arithmetic_intensity": round(res.cost.arithmetic_intensity, 4),
             "bound": res.cost.bound,
-        })
+        }
+        if time_kernels:
+            row["wall_ms"] = round(timeit(lambda: run_softmax(x)), 3)
+        rows.append(row)
 
     # matmul：tile 越大，算术强度越高（复用越多）
     for tile in (16, 32, 64):
         a = rng.standard_normal((256, 256)).astype(np.float32)
         b = rng.standard_normal((256, 256)).astype(np.float32)
         res = run_matmul(a, b, bm=tile, bn=tile, bk=16)
-        ms = timeit(lambda: run_matmul(a, b, bm=tile, bn=tile, bk=16))
-        rows.append({
+        row = {
             "kernel": "matmul_tiled",
             "shape": f"(256,256)x(256,256) tile={tile}",
-            "wall_ms": round(ms, 3),
             "predicted_us": round(res.cost.predicted_ms * 1000, 3),
             "bytes_total": res.cost.bytes_total,
             "flops": res.cost.flops,
             "arithmetic_intensity": round(res.cost.arithmetic_intensity, 4),
             "bound": res.cost.bound,
-        })
+        }
+        if time_kernels:
+            row["wall_ms"] = round(timeit(lambda: run_matmul(a, b, bm=tile, bn=tile, bk=16)), 3)
+        rows.append(row)
 
     # 融合增益：省下的字节 == 2×|C|，**前提是分块整除 M/N**。
     # 当 BN ∤ N 时，代价模型按「整块 tile」计字节（含被掩掉的填充 lane），
@@ -195,64 +203,80 @@ def main() -> None:
             schedule_rows.append({"shape": label, "tiles": shape.tiles,
                                   "iter_units": shape.iter_units, **row})
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    (OUT_DIR / "bench.json").write_text(
-        json.dumps({"kernels": rows, "fusion": fusion_rows, "smem": smem_rows,
-                    "bank": bank_rows, "reuse": reuse_rows,
-                    "precision": precision_rows, "schedule": schedule_rows,
-                    "schedule_verdict": schedule_verdicts},
-                   indent=2, ensure_ascii=False),
-        encoding="utf-8")
+    return {
+        "kernels": rows,
+        "fusion": fusion_rows,
+        "smem": smem_rows,
+        "bank": bank_rows,
+        "reuse": reuse_rows,
+        "precision": precision_rows,
+        "schedule": schedule_rows,
+        "schedule_verdict": schedule_verdicts,
+    }
 
+
+def render_markdown(data: dict) -> str:
+    """Render ``bench.md``. Wall-clock cells are whatever ``data`` already holds."""
+    rows = data["kernels"]
     header = "| kernel | shape | numpy 墙钟 (ms) | 模型预测 (µs) | 访存 (B) | FLOP | 算术强度 | 受限类型 |"
     sep = "|---|---|---:|---:|---:|---:|---:|---|"
     lines = [header, sep]
     for r in rows:
-        lines.append(f"| {r['kernel']} | {r['shape']} | {r['wall_ms']} | {r['predicted_us']} | "
+        wall = r.get("wall_ms", "")
+        lines.append(f"| {r['kernel']} | {r['shape']} | {wall} | {r['predicted_us']} | "
                      f"{r['bytes_total']} | {r['flops']} | {r['arithmetic_intensity']} | {r['bound']} |")
     lines.append("")
     lines.append("| 融合用例 | 未融合 (B) | 融合后 (B) | 省下 (B) | 两倍中间张量 (B) | 省下比例 | 等式成立 | 数值一致 | 说明 |")
     lines.append("|---|---:|---:|---:|---:|---:|---|---|---|")
-    for f in fusion_rows:
+    for f in data["fusion"]:
         lines.append(f"| {f['shape']} | {f['unfused_bytes']} | {f['fused_bytes']} | "
                      f"{f['saved_bytes']} | {f['expected_2_times_intermediate']} | "
                      f"{f['saved_fraction']} | {f['match']} | {f['outputs_close']} | {f['note']} |")
     lines.append("")
     lines.append("| tile | 未用 smem 访存 (B) | 用 smem 访存 (B) | 字节相等 | 数值一致 |")
     lines.append("|---|---:|---:|---|---|")
-    for r in smem_rows:
+    for r in data["smem"]:
         lines.append(f"| {r['tile']} | {r['bytes_plain']} | {r['bytes_smem']} | "
                      f"{r['bytes_equal']} | {r['close']} |")
     lines.append("")
     lines.append("| 共享内存行宽 (float) | 访问次数 | bank 冲突轮次 | 冲突率 |")
     lines.append("|---|---:|---:|---:|")
-    for r in bank_rows:
+    for r in data["bank"]:
         lines.append(f"| {r['pitch']} | {r['accesses']} | {r['conflicts']} | {r['rate']} |")
     lines.append("")
     lines.append("| 方阵 n | 逐块重读下界 (B) | 下界 AI | 下界受限 | 理想复用上界 (B) | 上界 AI | 上界受限 |")
     lines.append("|---|---:|---:|---|---:|---:|---|")
-    for r in reuse_rows:
+    for r in data["reuse"]:
         lines.append(f"| {r['n']} | {r['lower_bytes']} | {r['lower_ai']} | {r['lower_bound']} | "
                      f"{r['reuse_bytes']} | {r['reuse_ai']} | {r['reuse_bound']} |")
     lines.append("")
     lines.append("| shape | 累加精度 | 最大绝对误差 | 平均绝对误差 | 访存 (B) | FLOP |")
     lines.append("|---|---|---:|---:|---:|---:|")
-    for r in precision_rows:
+    for r in data["precision"]:
         lines.append(f"| {r['shape']} | {r['accumulate']} | {r['max_error']} | "
                      f"{r['mean_error']} | {r['bytes']} | {r['flops']} |")
     lines.append("")
     lines.append("| 形状 | 策略 | 单元数 | 波次 | 利用率 | 边界部分和 | 额外流量 (B) | 预测 (ms) |")
     lines.append("|---|---|---:|---:|---:|---:|---:|---:|")
-    for r in schedule_rows:
+    for r in data["schedule"]:
         lines.append(f"| {r['shape']} | {r['strategy']} | {r['units']} | {r['waves']} | "
                      f"{r['efficiency']:.4f} | {r['partial_cuts']} | {r['extra_bytes']} | "
                      f"{r['predicted_ms']} |")
     lines.append("")
     lines.append("推荐（按模型时间）：" + "；".join(
-        f"{v['shape']} → {v['best']}（splits={v['splits']}）" for v in schedule_verdicts))
-    table = "\n".join(lines)
-    (OUT_DIR / "bench.md").write_text(table + "\n", encoding="utf-8")
-    print(table)
+        f"{v['shape']} → {v['best']}（splits={v['splits']}）" for v in data["schedule_verdict"]))
+    return "\n".join(lines) + "\n"
+
+
+def main() -> None:
+    data = build_report(time_kernels=True)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    (OUT_DIR / "bench.json").write_text(
+        json.dumps(data, indent=2, ensure_ascii=False),
+        encoding="utf-8")
+    table = render_markdown(data)
+    (OUT_DIR / "bench.md").write_text(table, encoding="utf-8")
+    print(table, end="")
 
 
 if __name__ == "__main__":

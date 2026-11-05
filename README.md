@@ -1,63 +1,79 @@
 # gpgpu-kernel-lab
 
-一个**在纯 CPU 上就能跑通**的 GPGPU 算子 / 编译器 / PyTorch 适配实验台。
+没有 GPU 时，把 warp 掩码、访存合并、共享内存 bank 冲突、roofline 和算子融合做成可执行、可对拍的 CPU 模型。
+本仓库不测量真实 GPU。硬件耗时、达成带宽、bf16 存储流量、国产卡或 TPU 上的行为都是未知，不用模型输出去填。
+假设设备上的 predicted_ms 是公式，不是墙钟。CPU 上的计数用 `scripts/offline_cpu.sh` 重算。
 
-它不假装自己有 GPU。它做的是把真正决定 GPU 性能的机制——warp 掩码、分支发散、
-访存合并、共享内存 bank 冲突、roofline 受限判断、算子融合、分块调优、
-`torch.compile` 自定义后端、`torch.library` 自定义算子——做成**可执行、可测量、
-每个数字都能从本仓库代码重算**的最小实现。
+## 观测状态
 
-> 定位一句话：**这里的所有结论都来自代码，不来自话术。**
-> 你看到的每一个百分数、字节数、事务数，都能用 `pytest` 或
-> `benchmarks/run_benchmarks.py` 当场复算出来。
+| 主张 | 状态 | 怎么核对 |
+|---|---|---|
+| 事务数、bank 冲突、融合字节、复用上界、调度整数、tile 算术强度 | OBSERVED (CPU) | `pytest` 与 `scripts/verify_numbers.py` |
+| numpy 墙钟（`bench.md` 那一列） | OBSERVED (CPU)，随机器变，不设门槛 | `benchmarks/run_benchmarks.py`；不是设备时间 |
+| roofline 的 `predicted_ms` | OBSERVED (CPU) 的公式输出；设备参数是假设的 | 同一套脚本；不是硬件时间 |
+| 真实 GPU 耗时、达成带宽、bf16 存储流量、国产卡、TPU | UNKNOWN | 离线路径不跑；`benchmarks/results/` 里没有这些结果 |
+| `benchmarks/results/triton_softmax_t4.json` | 归档日志，不是这次观测 | `analyze_triton.py` 只重算模型侧分母；CI 不重跑 GPU |
 
----
+## 离线 CPU 路径
+
+依赖装好之后不需要网络，也不需要 GPU。CPU 版 PyTorch 就够。仓库现有 **148 个测试函数**。
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -e ".[dev]"
+bash scripts/offline_cpu.sh
+```
+
+`scripts/offline_cpu.sh` 依次跑 `pytest`、`scripts/verify_numbers.py`（含 `--selftest`）、
+`examples/quickstart.py`、`benchmarks/run_benchmarks.py`。它不调用 `benchmarks/triton/`
+或 `benchmarks/tpu/`。那些脚本在没有对应设备时退出，并且不写结果文件。
+
+没装 C++ 扩展时 pytest 是 145 passed + 1 个模块级 skip。装了扩展
+（`pip install -e ".[cpp]" --no-build-isolation`）是 167 passed。
+不想安装包时，用 `PYTHONPATH=src` 跑同样的四个入口。
+
+`examples/quickstart.py` 会打印设备参数卡、访存合并、分支发散、算子 IR 与代价、融合字节。
+打印出来的 TFLOPS 是假设参数，不是吞吐。
+
+## 清单
+
+这些个数由 `scripts/inventory.py` 对源码和 `benchmarks/results/bench.json` 重算。
+文档改了而树没改，`verify_numbers.py` 会失败。
+
+| 项 | 个数 |
+|---|---:|
+| test_functions | 148 |
+| pytest_items_with_cpp | 167 |
+| pytest_items_without_cpp | 145 |
+| pytest_module_skips_without_cpp | 1 |
+| cpp_pytest_items | 22 |
+| bench_kernel_rows | 9 |
+| bench_fusion_rows | 4 |
+| bench_smem_rows | 2 |
+| bench_bank_rows | 2 |
+| bench_reuse_rows | 3 |
+| bench_precision_rows | 4 |
+| bench_schedule_rows | 8 |
+| bench_schedule_verdicts | 2 |
+| ci_python_versions | 2 |
+| failure_modes | 11 |
 
 ## 它是什么 / 不是什么
 
 | 是 | 不是 |
 |---|---|
-| 一套能在 CPU 上真实执行的 SIMT 执行模型（掩码 / 发散 / 事务 / bank 冲突） | 一个 GPU 模拟器（不做周期级时序仿真） |
-| 一个 Triton 风格的 DSL → IR → pass → 执行器 / 代价模型 | 一个能跑在真实国产卡上的算子库 |
-| 用 `torch.library` + `torch.compile` 后端做的框架适配样例 | 一个生产可用的 PyTorch 后端 |
-| 六个算子（vector_add / scale_gelu / softmax / layernorm / matmul / fused_mlp）与 numpy 逐元素对拍 | 一份性能 benchmark 报告 |
+| 一套能在 CPU 上执行的 SIMT 模型（掩码 / 发散 / 事务 / bank 冲突） | 周期级 GPU 模拟器，或一张真实加速卡 |
+| 一个 Triton 风格的 DSL → IR → pass → 执行器 / 代价模型 | 一个能在国产卡上跑的算子库 |
+| `torch.library` + `torch.compile` 后端的 CPU 样例 | 生产可用的 PyTorch 设备后端 |
+| 六个算子与 numpy 逐元素对拍 | 一份 GPU 性能报告 |
 
-**边界（必须说清楚）**：本机没有 GPU（`nvidia-smi` / `nvcc` 均不存在，
-`torch.cuda.is_available() == False`），Triton 3.8 装了但没有 CPU driver
-（最小 kernel 直接报 `RuntimeError: 0 active drivers`）。所以：
+静默对不上硬件的地方写在 [docs/FAILURE_MODES.md](docs/FAILURE_MODES.md)。短的边界：
 
-- 设备模型里的 TFLOPS / 带宽是**假设机**（`DeviceInfo` 默认参数）算出的解析值，
-  **不是真卡实测**；
-- 代价模型给的是**理论下界**，不含 cache 命中、发射开销、bank 冲突的真实代价；
-- numpy 执行器的墙钟是「真的算了」，但它逐 block 走 Python 循环，
-  **比模型预测慢 2–3 个数量级是正常的**，不能当性能读数；
-- `explain()` 有一个已知局限：同一个原函数分别编译成 static 与 dynamic 两个包装时，
-  Dynamo 的 cache entry 是共享的，两个包装会被归到同一份结论（实测两者都返回
-  `只支持静态形状…s77`）。不同函数、以及同一包装的重编译都能正确区分。
-
----
-
-## 快速开始
-
-```bash
-cd gpgpu-kernel-lab
-# 方式 A（推荐，避免 PEP 668 externally-managed 报错）：源码直跑，不安装
-PYTHONPATH=src python3 -m pytest            # 154 个用例通过（含 C++ 扩展；未构建扩展时 132 passed + 1 模块级 skip）
-PYTHONPATH=src python3 examples/quickstart.py
-PYTHONPATH=src python3 benchmarks/run_benchmarks.py
-
-# 方式 B（正常 venv 内）：editable 安装后直接 pytest
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"                       # numpy + torch + pytest（可再加 pybind11）
-pytest                                        # 同上 154 个用例
-```
-
-2026-11-01 实测：宿主机是 PEP 668 externally-managed（`pip install -e .` 被拒），
-所以**方式 A 是在这台机器上的可靠路径**——`PYTHONPATH=src` 让 `pytest`、
-`examples/quickstart.py`、`benchmarks/run_benchmarks.py` 三个入口都无需安装即可跑。
-
-`examples/quickstart.py` 会依次打印：设备模型、访存合并对比、分支发散、
-六个算子的 IR 与代价、融合省下的字节、`torch.compile` 融合结论。
+- 默认 `DeviceInfo` 的 TFLOPS / 带宽是假设参数，不是某张卡的规格书；
+- 代价模型是理论下界，不含 cache、发射开销、bank 冲突的时间；
+- numpy 墙钟是 Python 循环，不能当性能读数；
+- `explain()` 在同一原函数的 static / dynamic 两个包装之间会共享 Dynamo cache entry。
 
 ---
 
@@ -87,9 +103,12 @@ src/gkern/
 
 ---
 
-## 可复算的数字（全部来自 `benchmarks/run_benchmarks.py` 与 `pytest`）
+## 可复算的数字（OBSERVED (CPU)，来自 `benchmarks/run_benchmarks.py` 与 `pytest`）
 
-**设备模型（解析值，假设机）**
+下面的表是 CPU 上的计数或公式。`predicted_ms` / `µs` 用的是假设参数卡，不是硬件时间。
+numpy 墙钟只出现在 `benchmarks/results/bench.md`，不在这里当结果引用。
+
+**设备模型（解析值，虚构参数卡 `generic-domestic-gpgpu`）**
 
 | 量 | 值 | 公式 |
 |---|---:|---|
@@ -153,8 +172,8 @@ global → L1 的往返与 bank 冲突，不是 HBM 流量：每个 block 仍然
 | 2048 | 1090519040 | 16.25 | memory | 50331648 | 352.0 | compute |
 
 理想复用（每个输入只从 HBM 读一次）下方阵 GEMM 的 `AI = N/6`，
-交叉点 256 FLOP/B 需要 **N ≥ 1536**——而把 tile 从 16 加到 128，
-AI 只从 4.27 涨到 29.59，离交叉点差一个数量级。**调 tile 翻不动 bound，
+交叉点 256 FLOP/B 需要 **N ≥ 1536**——而 n=512 时把 tile 从 16 加到 128，
+AI 只从 4.0615 涨到 29.3333，离交叉点差一个数量级。**调 tile 翻不动 bound，
 是这里的算术决定的，不是调参不够努力。**
 
 **bank 冲突：同一个算子，行宽差 1 个 float**
@@ -202,8 +221,7 @@ PYTHONPATH=src python3 scripts/verify_cpp.py
 ```
 
 `scripts/verify_cpp.py` 是硬门禁：模块缺失直接 `exit 2`（不允许「没构建就算通过」），
-存在时跑 1200 组随机/边界输入的逐值对拍，再量一次同工作量的耗时
-（1M 偏移：`count_transactions` 约 9×、`warp_bank_conflicts` 约 33×，本机 Ryzen 7 5800H）。
+存在时跑 1200 组随机/边界输入的逐值对拍。脚本会再打印一次耗时比，这个比不设门槛，也不进入清单。
 
 写这份代码暴露的真问题不是性能，而是**跨语言语义差**：Python 的 `//` 向下取整，
 C++ 的 `/` 向零截断，`[-1, -128, -129, 0]` 在 Python 里是 3 个事务段、在朴素的 C++
@@ -212,7 +230,7 @@ C++ 的 `/` 向零截断，`[-1, -128, -129, 0]` 在 Python 里是 3 个事务�
 **混合精度：精度是免费的，但必须显式选**
 
 `gkern.ops.mixed_precision` 把「累加精度」写成 IR 里的显式舍入点（`tl.round_bf16`），
-softmax 在四个位置降精度（输入、行最大值、指数结果、归约和）。实测同一个 256×1024 输入：
+softmax 在四个位置降精度（输入、行最大值、指数结果、归约和）。CPU 上同一个 256×1024 输入：
 
 | 累加精度 | 最大绝对误差 | 访存 (B) | FLOP |
 |---|---:|---:|---:|
@@ -223,35 +241,19 @@ softmax 在四个位置降精度（输入、行最大值、指数结果、归约
 数值决策，而不像很多人以为的那样是性能决策。误差大了约 10 万倍这件事，被写成了
 `tests/test_mixed_precision.py` 的断言，防止哪天实现偷偷没降精度却还挂着 bf16 的名字。
 
-**这一格在真实 GPU 上还没量**（Kaggle 每周 GPU 额度 2026-11-01 已用尽：32.75h/30h、
-剩余 0.00h，`kaggle kernels push` 被平台拒绝）。脚本 `benchmarks/triton/bench_bf16_softmax.py`
-已提交、可直接跑，缺口与补齐命令写在 `docs/cloud-reconciliation.md` 最后一节——
-不写「应该差不多」这种话。
+真实 GPU 上 bf16 存储省不省带宽、误差是不是仍是这个量级，都是 UNKNOWN。
+`benchmarks/results/` 里没有 bf16 GPU 结果，也没有 TPU 结果。
+`benchmarks/triton/bench_bf16_softmax.py` 与 `benchmarks/tpu/bench_bf16_softmax_jax.py`
+在没有对应设备时直接退出，不写文件。
 
 ---
 
-**云端实测：T4 上量一次，再回头问模型准不准**
+**归档的 T4 softmax 日志不是 OBSERVED (CPU)**
 
-本仓库其他数字都是 CPU 上可复算的机制演示；唯独这一节是**真实 GPU 实测**，
-两者混用就是自欺，所以证据、脚本、对账三者分开写：
-
-| 项 | 值 |
-|---|---|
-| 平台 | Kaggle 私有 kernel，Tesla T4（40 SM） |
-| 环境 | torch 2.11.0+cu128、triton 3.6.0、Python 3.13.15 |
-| 采集 | `benchmarks/triton/bench_softmax_triton.py`（`do_bench` warmup=25/rep=100） |
-| 证据 | `benchmarks/results/triton_softmax_t4.json`（带 provenance） |
-| 对账 | `benchmarks/analyze_triton.py --write-report` → `docs/cloud-reconciliation.md` |
-
-三条结论（每条都在对账文档里带表）：
-
-1. **模型是严格下界**：实测/预测 = 1.36～1.40，即 71%～74% 的理论带宽；
-   五档 shape 的受限类型判得全对（都是 `memory`），但别把 `predicted_ms` 当成能跑到的时间。
-2. **小 shape 掉到 49%**：cols=512 时占用率不足，模型的问题定义里就没有这一项。
-3. **手写 Triton fused softmax 没稳定赢过 `torch.softmax`**（cols=512 慢 26%，
-   1024/2048 快约 1.08～1.10×，4096/8192 反而慢 3%～5%）。CPU 侧的字节账
-   「融合省掉中间张量」是真的，但它推不出「手写 kernel 更快」——
-   eager 行 softmax 本身已是单遍带宽受限实现。
+`benchmarks/results/triton_softmax_t4.json` 是一份带 provenance 的旧日志。
+`benchmarks/analyze_triton.py` 可以拿它重算「日志里的毫秒 / 模型预测」。
+离线路径和 CI 都不重跑 GPU，所以真实 GPU 行为在本仓库的复算口径里仍然是 UNKNOWN。
+这份日志不能说明什么，写在 `docs/cloud-reconciliation.md`。
 
 ---
 
@@ -259,7 +261,8 @@ softmax 在四个位置降精度（输入、行最大值、指数结果、归约
 
 矩阵乘在硬件上不是「一次算完」，而是把输出切成 tile 铺到 SM 上排队。100 个 tile
 铺 40 个 SM：40 + 40 + 20 —— 最后一波一半 SM 空转，整体利用率 0.83。这个账在
-`gkern/schedule/` 里是可复算的整数，不是直觉（数字来自 `benchmarks/results/bench.md`）：
+`gkern/schedule/` 里是可复算的整数，不是直觉（数字来自 `benchmarks/results/bench.md`）。
+表里的「预测 (ms)」用的是 `DeviceInfo.tesla_t4()` 参数卡，不是 T4 墙钟；真实 GPU 时间是 UNKNOWN：
 
 | 形状 | 策略 | 单元数 | 波次 | 利用率 | 边界部分和 | 额外流量 (B) | 预测 (ms) |
 |---|---|---:|---:|---:|---:|---:|---:|
@@ -279,7 +282,7 @@ softmax 在四个位置降精度（输入、行最大值、指数结果、归约
    就是为了把这个常见误解钉死。
 2. **split-K 在宽扁大矩阵上几乎免费**：额外流量 26 MB 看着吓人，但同一形状的计算
    时间是 0.21 ms，26 MB 在 320 GB/s 下只要 0.08 ms——被计算盖住，而利用率从
-   0.83 提到 1.00。所以它在这个形状上赢。
+   0.83 提到 1.00。所以模型在这个形状上把它排在前面。这是参数卡上的排序，不是测到的墙钟。
 3. **stream-K 在「输出极小、K 极深」时翻盘**：256×256 的输出只有 4 个 tile，
    naive 利用率 0.1（40 个槽里 36 个空着）；stream-K 以 k-iter 为单元把粒度细 512 倍，
    利用率 0.98，且只在 39 个跨 worker 边界落部分和（5.1 MB），比 split-K×16 的
@@ -289,7 +292,7 @@ softmax 在四个位置降精度（输入、行最大值、指数结果、归约
 
 「边界部分和」那一列**不是闭式公式算的**：`streamk_units()` 把 3300 / 2048 次 k-迭代
 真的切成连续区间（分别 139 / 43 段），再从划分里数出「哪些 tile 被多个 worker 累加」。
-闭式 `capacity−1 = 39` 只是上界，本机两个形状恰好都等于 39——凑巧相等不算数，
+闭式 `capacity−1 = 39` 只是上界，这两个形状恰好都等于 39——凑巧相等不算数，
 所以测试断言的是「两套账必须一致」，一旦划分改了而表里的数没改，闸就红。
 
 诚实边界：`predicted_ms` 只含「计算 ÷ 利用率」与「字节 ÷ 带宽」两项，
@@ -359,14 +362,14 @@ softmax 在四个位置降精度（输入、行最大值、指数结果、归约
 ## 测试与自检闸
 
 ```bash
-PYTHONPATH=src python3 -m pytest              # 154 passed（含 C++ 扩展；未构建扩展时 132 passed + 1 个模块级 skip）
+PYTHONPATH=src python3 -m pytest              # 167 passed（含 C++ 扩展；未构建扩展时 145 passed + 1 个模块级 skip）
 PYTHONPATH=src python3 scripts/verify_numbers.py            # 重算文档里每个数字
 PYTHONPATH=src python3 scripts/verify_numbers.py --selftest # 证明这个闸会红
 ```
 
-仓库现有 **135 个测试函数**（含 C++ 扩展时 pytest 收集 154 条用例；未构建扩展时
-132 passed + 1 个模块级 skip）。这个「函数个数」被 `verify_numbers.py` 当断言盯着——
-用例数会随可选扩展变，函数个数不会，所以拿它做机器无关的文档闸。
+仓库现有 **148 个测试函数**（含 C++ 扩展时 pytest 收集 167 条用例；未构建扩展时
+145 passed + 1 个模块级 skip）。个数在上面的清单里，由 `scripts/inventory.py` 对源码重算——
+用例数会随可选扩展变，函数个数不会，所以清单同时记下这两种收集结果。
 
 `scripts/verify_numbers.py` 是「文档数字会漂移」这个问题的可执行对策：它把
 README/文档里出现的每个数值（26.2144 TFLOPS、102.4 GB/s、64/2048 事务、
@@ -413,7 +416,7 @@ README/文档里出现的每个数值（26.2144 TFLOPS、102.4 GB/s、64/2048 �
 - [x] 共享内存分块 GEMM + 复用上界模型（`reuse_bound`：理想 L2 复用下 `AI = N/6 + N/192`，
       n=2048 首次判为 compute；同时证明 smem 本身不改 HBM 字节）
 - [x] `PrivateUse1` 设备后端骨架（设备对象与查询函数接上，分配器 / kernel 缺口清单化）
-- [x] 云端 GPU 实测 + 代价模型对账（T4：`docs/cloud-reconciliation.md`）
+- [x] 归档一份 T4 softmax 日志（离线路径不重跑；见 `docs/cloud-reconciliation.md`）
 - [x] 分块在线 softmax（输入只读一遍，字节账差恰好一整遍输入）
 - [x] 调度层：波量化 + naive / split-K / stream-K / persistent 四种分解的账与推荐
 - [x] C++ 第二实现（pybind11，跨语言语义差用 `floor_div` 钉住）+ bf16 混合精度
@@ -424,7 +427,8 @@ README/文档里出现的每个数值（26.2144 TFLOPS、102.4 GB/s、64/2048 �
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)：三档保真度、IR 为什么是线性指令表、融合不变量的边界、代价模型的两个口径、调度层的波量化与工作分解。
 - [docs/jd-mapping.md](docs/jd-mapping.md)：招聘要求 ↔ 本仓库可运行证据逐条对照，**含三个必须承认的缺口**。
 - [docs/ecosystem.md](docs/ecosystem.md)：正表 30 行 / 28 个唯一仓库，附表 21 行 / 相对正表新增 19 个，全文 51 行 / 47 个唯一仓库（全部 2026-10-31 用 GitHub API 复核）逐个用 GitHub API 验真，含源码入口级阅读路径与失效路径说明。
-- [docs/cloud-reconciliation.md](docs/cloud-reconciliation.md)：唯一的硬件实测证据（T4）与代价模型的对账，含「手写 softmax 没赢过 eager」这条不舒服的结论。
+- [docs/FAILURE_MODES.md](docs/FAILURE_MODES.md)：CPU 模拟器在哪些地方会不报错地给出一个不像真实 GPU 的数。
+- [docs/cloud-reconciliation.md](docs/cloud-reconciliation.md)：一份不由 CI 重跑的 T4 softmax 归档，以及它不能说明什么。UNKNOWN 的格子（bf16 GPU、TPU）保持空白。
 - [docs/domestic-card-notes.md](docs/domestic-card-notes.md)：国产卡（昇腾/vllm-ascend）与 CUDA 侧的 attention 源码对照，逐条判定本仓库哪几条建模假设在 NPU 上直接失效。
 - [docs/papers.md](docs/papers.md)：8 篇论文的文献地图（在线 softmax / GEMM 分解 / 融合 / 代价模型），每篇都标了「能落成本仓库哪个模块的什么改动」与「我们不做的那部分」。
 - [benchmarks/results/bench.md](benchmarks/results/bench.md)：最近一次基准输出（数值墙钟 × 模型预测 × 受限类型 × 融合等式）。

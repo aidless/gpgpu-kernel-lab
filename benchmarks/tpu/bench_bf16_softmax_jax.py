@@ -1,25 +1,20 @@
-"""在 TPU（JAX/XLA）上量同一组 bf16 舍入点的误差——T4 额度用尽时的平行证据。
+"""在 TPU（JAX/XLA）上量同一组 bf16 舍入点的误差。
 
-它不是「T4 的替代品」，而是另一块真实加速卡上的**同一问题的另一次提问**：
+本仓库没有这份脚本的输出。没有 TPU 设备时它直接退出，不写 JSON。
+CPU 上的 JAX 同样退出：那不是 TPU 结果。
 
-- 变体 `fp32` / `bf16acc` / `bf16io` 的**语义**与 `benchmarks/triton/bench_bf16_softmax.py`
-  完全对齐（`bf16acc` 仍是「存取 float32、只在输入/行最大值/指数结果/归约和四处
-  把中间值舍到 bf16」）；
-- 差别在**执行栈**：XLA 会把整条行 softmax 融成一片，而 Triton 里每个 program
-  是一个 block。所以耗时不与 T4 可比，**只有误差量级**是可以跨平台对照的那一格。
+变体 `fp32` / `bf16acc` / `bf16io` 的语义与
+`benchmarks/triton/bench_bf16_softmax.py` 对齐。耗时不能拿去和别的平台比。
 
-写这个脚本的原因是 Kaggle 的每周 GPU 额度已用尽（2026-11-01 实测 32.75h/30h，
-剩余 0.00h），而 TPU 额度 20h 仍在。与其把 bf16 误差这一格留成空白，不如在另一块
-真实加速卡上把它量出来，并把「哪一格可以跨平台对照」写清楚。
+用法（仅在 jax.devices() 里真有 TPU 时）::
 
-用法（Kaggle TPU 内核）::
-
-    python bench_bf16_softmax_jax.py --out /kaggle/working/bf16_softmax_tpu.json
+    python bench_bf16_softmax_jax.py --out bf16_softmax_tpu.json
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import platform
 import statistics
@@ -84,6 +79,9 @@ def main() -> None:
     args = ap.parse_args()
 
     jax, jnp = _require_jax()
+    platforms = [device.platform for device in jax.devices()]
+    if "tpu" not in platforms:
+        sys.exit(f"需要 TPU 设备；当前是 {platforms}。不写结果文件。")
     softmax_fp32, softmax_bf16acc = _build(jnp)
     jsoft32 = jax.jit(softmax_fp32)
     jsoftacc = jax.jit(softmax_bf16acc)
@@ -131,12 +129,12 @@ def main() -> None:
             for c in cases))
 
     payload = {
-        "measured_on": "2026-11-01",
-        "platform": "kaggle-tpu",
+        "measured_on": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "platform": platforms,
         "jax": jax.__version__,
         "python": platform.python_version(),
-        "note": "误差量级可与 T4 对照；耗时不与 T4 可比（XLA 融合 vs Triton block）",
-        "script_in_repo": "gpgpu-kernel-lab/benchmarks/tpu/bench_bf16_softmax_jax.py",
+        "note": "只有在 jax 报告了 TPU 设备时才会写出这个文件。耗时不能拿去和别的平台比。",
+        "script_in_repo": "benchmarks/tpu/bench_bf16_softmax_jax.py",
         "results": results,
     }
     Path(args.out).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")

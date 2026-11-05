@@ -1,8 +1,11 @@
-# 云端实测 vs 代价模型：T4 上的行 softmax 对账
+# 云端归档 vs 代价模型：T4 上的行 softmax 对账
 
-这份文档存在的理由：本仓库其余部分的数字都是 **CPU 上可复算的机制演示**，
-唯独这里出现**真实 GPU 的实测值**。两者混用是这类项目最常见的自欺方式，
-所以把它单独拎出来，写清「证据在哪、模型预测多少、差在哪、为什么差」。
+> 状态：归档，不是 OBSERVED (CPU)。分子来自 `benchmarks/results/triton_softmax_t4.json`，
+> 这份文件不由离线路径或 CI 重跑。真实 GPU 行为在复算口径里仍然是 UNKNOWN。
+> 下面的比值是「归档毫秒 / 当前模型预测」，不是一次新的测量。
+
+这份文档存在的理由：本仓库其余部分的数字都是 **CPU 上可复算的机制演示**。
+这里单独放一份旧的 GPU 日志，避免把它和 CPU 计数写成同一类结论。
 
 ## 证据
 
@@ -72,36 +75,18 @@ PyTorch 的 eager 行 softmax 本身已经是单遍、带宽受限的实现，�
 - 不能当简历上的 GFLOPS 实绩：这里唯一的算力数字是**理论峰值**，实测的是带宽（GB/s），
   且只有 T4 一个平台。
 
-## 还没量的一格：bf16 累加在真实 GPU 上的误差与带宽
+## 还没量的一格：bf16 与 TPU
 
-CPU 侧已经能算准两件事：`bf16acc` 与 `fp32` 的**访存字节完全相同**、FLOP 只多四次舍入
-（`src/gkern/ops/mixed_precision.py`，数字见 README）。但算不出两件只有硬件能回答的事：
+CPU 侧能算的是：bf16 舍入与 fp32 的访存字节相同，因为存储仍是 float32
+（`src/gkern/ops/mixed_precision.py`）。下面两件事是 UNKNOWN：
 
-1. 真实 kernel 上四处舍入带来的误差是不是仍是 1e-2 量级（CPU 上是 5.87e-03）；
-2. **bf16 存储**（不是只舍入累加器）到底省不省带宽——这才是真正可能提速的那一档。
+1. 真实 kernel 上四处舍入的误差是不是仍是 1e-2 量级（CPU 上这一输入是 5.87e-03）；
+2. bf16 **存储**（不是只舍入累加器）改不改搬运的字节。
 
-量这两件事的脚本已经写好并提交：`benchmarks/triton/bench_bf16_softmax.py`。它跑三种变体
-（`fp32` / `bf16acc` / `bf16io`）+ torch eager 基线，输出 ms、GB/s、相对 float64 参考的
-最大/平均误差，无 CUDA 时直接退出（不伪造数字）。
+`benchmarks/results/` 里没有 bf16 GPU JSON，也没有 TPU JSON。
+下面两个脚本在没有对应设备时退出，并且不写文件：
 
-**为什么现在还没有数字**：Kaggle 的每周 GPU 额度已用尽。实测
-（`python3 -m kaggle quota`，2026-11-01）：
+- `benchmarks/triton/bench_bf16_softmax.py`（需要 CUDA）
+- `benchmarks/tpu/bench_bf16_softmax_jax.py`（需要 JAX 报告 TPU；CPU 上的 JAX 也退出）
 
-| 资源 | 已用 | 剩余 | 总额 | 恢复时间 |
-|---|---:|---:|---:|---|
-| GPU | 32.75h | **0.00h** | 30.00h | 2026-11-07T00:00:00 |
-| TPU | 0.00h | 20.00h | 20.00h | 2026-11-07T00:00:00 |
-
-`kaggle kernels push` 被平台直接拒绝：`Maximum weekly GPU quota of 30.00 hours reached.`
-
-所以这一格是**明确的空白**，不是被省略的结论。额度恢复后一条命令即可补齐：
-
-```bash
-# 把 benchmarks/triton/bench_bf16_softmax.py 与一个调用它的 kernel_main.py 一起 push
-python3 -m kaggle kernels push      # T4 / GPU 模式，--out /kaggle/working/bf16_softmax.json
-python3 -m kaggle kernels output liuzewen123/gkern-bf16-softmax-error -p .
-# 然后把 bf16_softmax.json 原样提交进 benchmarks/results/，并在本文件补一节对账
-```
-
-在此之前，任何关于「bf16 在 GPU 上快多少」的说法都不该出现在这个仓库里——那正是
-`docs/cloud-reconciliation.md` 存在的意义：把「模型说的」和「量到的」分开写。
+在有结果文件之前，不要写「bf16 在 GPU 上快多少」。

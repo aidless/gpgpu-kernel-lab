@@ -5,7 +5,7 @@
 
 用法（云上）::
 
-    python bench_softmax_triton.py --out /kaggle/working/triton_softmax.json
+    python bench_softmax_triton.py --out triton_softmax.json
 
 它回答三个问题，且每个答案都带出处：
 

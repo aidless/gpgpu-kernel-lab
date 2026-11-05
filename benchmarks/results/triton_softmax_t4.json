@@ -76,7 +76,7 @@
     "platform": "Kaggle Notebook GPU kernel, Tesla T4, private",
     "kernel_url": "https://www.kaggle.com/code/liuzewen123/gkern-triton-softmax-bandwidth",
     "script_in_repo": "benchmarks/triton/bench_softmax_triton.py",
-    "how": "python -m kaggle kernels push -p /tmp/gkern-kaggle; python -m kaggle kernels output ...",
+    "how": "kaggle kernels push of benchmarks/triton/bench_softmax_triton.py; output saved as this file",
     "quota_after_run": "GPU used 26.48h / total 30.00h (remaining 3.52h, refreshAt 2026-11-07T00:00:00)",
     "note": "唯一允许出现硬件实测数字的文件；数值全部来自该脚本的 do_bench 输出，未手工改过"
   }

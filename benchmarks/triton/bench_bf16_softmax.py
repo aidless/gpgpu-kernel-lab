@@ -18,7 +18,7 @@ CPU 侧的 `gkern.ops.mixed_precision` 能算出「字节完全一样、FLOP 只
 
 用法（云上）::
 
-    python bench_bf16_softmax.py --out /kaggle/working/bf16_softmax.json
+    python bench_bf16_softmax.py --out bf16_softmax.json
 
 无 CUDA 时直接退出（不伪造数字）。
 """
@@ -26,6 +26,7 @@ CPU 侧的 `gkern.ops.mixed_precision` 能算出「字节完全一样、FLOP 只
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import platform
 import sys
@@ -160,16 +161,15 @@ def main() -> None:
             f"max_err {c['max_error']:.2e}" for c in cases))
 
     payload = {
-        "measured_on": "2026-11-01",
-        "device": dev.name,
+        "measured_on": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "device": torch.cuda.get_device_name(0),
         "sm_count": dev.multi_processor_count,
         "torch": torch.__version__,
         "triton": triton.__version__,
         "cuda": torch.version.cuda,
         "python": platform.python_version(),
-        "script_in_repo": "gpgpu-kernel-lab/benchmarks/triton/bench_bf16_softmax.py",
-        "how": "kaggle kernels push（T4，GPU 模式），结果 JSON 由本脚本写出，"
-               "原样提交进仓库 benchmarks/results/",
+        "script_in_repo": "benchmarks/triton/bench_bf16_softmax.py",
+        "how": "this process on the CUDA device named above; the offline CPU path does not run it",
         "results": results,
     }
     Path(args.out).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")

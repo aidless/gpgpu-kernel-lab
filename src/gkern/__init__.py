@@ -12,7 +12,8 @@
 共享内存 bank、roofline、算子融合、分块调优）做成可执行、可测量、可测试的模型，
 再用同一套 IR 对接 PyTorch 的扩展机制（见 :mod:`gkern.torch_ext`）。
 
-所有数字都能从本仓库的代码重算，没有任何「引用自某处」的估值。
+CPU 路径上的计数可以从本仓库代码重算。真实 GPU 的耗时不在这里，
+也不要用参数卡上的 TFLOPS 充当实测。
 """
 
 from . import compiler, gpgpu, ops

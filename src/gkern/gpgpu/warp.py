@@ -7,7 +7,7 @@ warp 里的 lane 走进不同的分支，硬件不能并行执行两条路径，
 
 本模块把这件事做成可测量的：
 
-- 每条指令记一次 ``instruction``，消耗 32 个 lane 槽；
+- 每条指令记一次 ``instruction``，消耗 ``warp_size`` 个 lane 槽；
 - 真正干活的是活跃 lane，记入 ``active_lane_cycles``；
 - 走两次分支则指令数翻倍 → 发散效率自然下降。
 
@@ -59,6 +59,7 @@ class DivergenceReport:
     active_lane_cycles: int = 0
     diverged_branches: int = 0
     branch_count: int = 0
+    issued_lane_slots: int = 0
 
     def add(self, trace: WarpTrace) -> None:
         self.warps += 1
@@ -66,13 +67,15 @@ class DivergenceReport:
         self.active_lane_cycles += trace.active_lane_cycles
         self.diverged_branches += trace.diverged_branches
         self.branch_count += trace.branch_count
+        # 用每条轨迹自己的 warp_size。写成 ``instructions * 32`` 时，
+        # wave64 会把效率算成大于 1，而且不报错。
+        self.issued_lane_slots += trace.issued_lane_slots
 
     @property
     def efficiency(self) -> float:
-        slots = self.instructions * 32
-        if slots == 0:
+        if self.issued_lane_slots == 0:
             return 1.0
-        return self.active_lane_cycles / float(slots)
+        return self.active_lane_cycles / float(self.issued_lane_slots)
 
     @property
     def divergence_rate(self) -> float:

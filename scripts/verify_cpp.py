@@ -9,7 +9,7 @@
 
 用法::
 
-    python3 scripts/build_cpp.py          # 或者 pip install -e ".[cpp]" --no-build-isolation
+    pip install pybind11 && pip install -e ".[cpp]" --no-build-isolation
     python3 scripts/verify_cpp.py
 """
 
