@@ -3,7 +3,7 @@
 一个「能被 torch 生态正常使用」的自定义算子需要四件东西，缺一件就会在某个
 环节静默出错：
 
-1. **CPU/CUDA 实现**——真的算；
+1. **实现**——本模块是 CPU 上的 numpy，没有 CUDA kernel；
 2. **meta 实现**（fake tensor）——否则 ``torch.compile`` 抓图时直接失败；
 3. **autograd**——否则反向传播断链（或者更糟：悄悄不求导）；
 4. **schema**——参数名/可变性声明，决定它能不能被 functionalize。

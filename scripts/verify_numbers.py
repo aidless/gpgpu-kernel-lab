@@ -296,6 +296,13 @@ check("count_transactions_128B_split",
 check("count_transactions_same_segment",
       count_transactions(np.array([0, 4, 8], dtype=np.int64)), 1)
 
+# 6. 清单、FAILURE_MODES、徽章和绝对路径（机器无关的漂移闸）
+import inventory as _inventory  # noqa: E402
+
+for _item in _inventory.check(_root):
+    failures.append(_item)
+    print(f"FAIL {_item}")
+
 # ---- 自检：闸必须能失败（AGENTS「门必须能失败」） ----------------------
 if "--selftest" in sys.argv:
     # 故意把一项期望值改错，再跑同一套检查，必须报错才算闸有效。

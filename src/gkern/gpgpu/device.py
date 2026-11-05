@@ -8,7 +8,8 @@ Python 里能被真正展开，而不是被当成一次标量调用。
 1. 所有层级都是**不可变数据 + 显式索引**，便于在报告里精确定位到
    ``block=3, warp=1, lane=7`` 这样的坐标；
 2. 设备规格（SM 数、warp 大小、共享内存容量、寄存器文件大小）集中在
-   :class:`DeviceInfo`，算子与编译器只读它，不硬编码 32/64 这类魔数；
+   :class:`DeviceInfo`。SIMT 启动器读取 ``warp_size``；编译器执行器的 bank
+   分组仍固定 32，见 ``docs/FAILURE_MODES.md`` 的 ``compiler-wave-32``；
 3. 设备对象本身不执行任何计算，只负责「把 grid 切成 block、把 block 切成 warp」，
    执行语义在 :mod:`gkern.gpgpu.warp` 与 :mod:`gkern.gpgpu.kernel`。
 """
@@ -21,7 +22,11 @@ from typing import Iterator, List, Sequence
 
 @dataclass(frozen=True)
 class DeviceInfo:
-    """设备规格。默认值取自一个典型的国产通用 GPU 加速卡（SIMT 结构）。"""
+    """设备规格。
+
+    默认值是一份虚构的 SIMT 参数卡（``generic-domestic-gpgpu``），只为了让
+    roofline 有数可算。它不是某张国产卡的规格，也不是实测。
+    """
 
     name: str = "generic-domestic-gpgpu"
     sm_count: int = 64                 # 流式多处理器个数

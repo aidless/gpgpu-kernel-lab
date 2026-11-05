@@ -208,7 +208,7 @@ def launch(fn: Callable, buffers: Dict[str, np.ndarray],
     blocks = 0
     for block in dev.iter_blocks(grid_t):
         blocks += 1
-        smem = SharedMemory(smem_n, stats) if smem_n else None
+        smem = SharedMemory(smem_n, stats, warp_size=warp_size) if smem_n else None
         for w in range(warps_per_block):
             lane_ids = np.arange(w * warp_size, (w + 1) * warp_size, dtype=np.int64)
             # block 内线程号超过 block 维度的 lane 需要被掩掉

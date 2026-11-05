@@ -160,11 +160,13 @@ class SharedMemory:
     """
 
     def __init__(self, elements: int, stats: Optional[MemoryStats] = None,
-                 item_bytes: int = 4, bank_count: int = BANK_COUNT) -> None:
+                 item_bytes: int = 4, bank_count: int = BANK_COUNT,
+                 warp_size: int = 32) -> None:
         self.data = np.zeros(elements, dtype=np.float32)
         self.stats = stats if stats is not None else MemoryStats()
         self.item_bytes = item_bytes
         self.bank_count = bank_count
+        self.warp_size = warp_size
         self.stats.smem_bytes += elements * item_bytes
 
     def load(self, indices: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -173,7 +175,7 @@ class SharedMemory:
         active = indices[mask]
         self.stats.shared_accesses += int(active.size)
         self.stats.shared_bank_conflicts += warp_bank_conflicts(
-            active, self.item_bytes, self.bank_count)
+            active, self.item_bytes, self.bank_count, self.warp_size)
         out = np.zeros(indices.shape, dtype=np.float32)
         valid = mask & (indices >= 0) & (indices < self.data.shape[0])
         out[valid] = self.data[indices[valid]]
@@ -185,6 +187,6 @@ class SharedMemory:
         active = indices[mask]
         self.stats.shared_accesses += int(active.size)
         self.stats.shared_bank_conflicts += warp_bank_conflicts(
-            active, self.item_bytes, self.bank_count)
+            active, self.item_bytes, self.bank_count, self.warp_size)
         valid = mask & (indices >= 0) & (indices < self.data.shape[0])
         self.data[indices[valid]] = values[valid]

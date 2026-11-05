@@ -24,8 +24,8 @@ jobs:
           pip install --index-url https://download.pytorch.org/whl/cpu torch
       - name: Install package
         run: pip install -e ".[dev]"
-      # build isolation 里没有 pybind11，setup.py 会静默跳过扩展；必须 --no-build-isolation，
-      # 否则「测试通过」里混着 22 条被跳过的 C++ 用例（详见 README 坑 #12）。
+      # build isolation 里没有 pybind11，setup.py 会静默跳过扩展；必须 --no-build-isolation。
+      # 跳过时少掉的用例数由清单闸核对：cpp_pytest_items=22
       - name: Build the optional C++ extension
         run: |
           pip install pybind11
