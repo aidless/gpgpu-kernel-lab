@@ -1,5 +1,7 @@
 # gpgpu-kernel-lab
 
+[![CI](https://github.com/aidless/gpgpu-kernel-lab/actions/workflows/ci.yml/badge.svg)](https://github.com/aidless/gpgpu-kernel-lab/actions/workflows/ci.yml)
+
 一个**在纯 CPU 上就能跑通**的 GPGPU 算子 / 编译器 / PyTorch 适配实验台。
 
 它不假装自己有 GPU。它做的是把真正决定 GPU 性能的机制——warp 掩码、分支发散、
