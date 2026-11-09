@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/aidless/gpgpu-kernel-lab/actions/workflows/ci.yml/badge.svg)](https://github.com/aidless/gpgpu-kernel-lab/actions/workflows/ci.yml)
 
+> **English TL;DR**: A GPGPU operator/compiler/PyTorch-adaptation lab that runs entirely on CPU: an executable SIMT model (masks, divergence, coalescing transactions, bank conflicts), a Triton-style DSL→IR→pass→numpy-executor stack with a cost model, six operators checked element-wise against numpy, plus `torch.library` custom ops and a `torch.compile` backend. Run `PYTHONPATH=src python3 -m pytest` and `benchmarks/run_benchmarks.py`; `scripts/verify_numbers.py` recomputes every documented figure. It is explicitly not a cycle-level GPU simulator or production backend; the single real-GPU (T4) measurement is reconciled separately.
+
 一个**在纯 CPU 上就能跑通**的 GPGPU 算子 / 编译器 / PyTorch 适配实验台。
 
 它不假装自己有 GPU。它做的是把真正决定 GPU 性能的机制——warp 掩码、分支发散、
