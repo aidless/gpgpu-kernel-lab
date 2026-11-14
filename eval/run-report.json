@@ -1,0 +1,129 @@
+{
+ "total": 20,
+ "passed": 20,
+ "failed": 0,
+ "selftest": false,
+ "failed_by_axis": {},
+ "results": [
+  {
+   "id": "GP-01",
+   "axis": "device/peak",
+   "ok": true,
+   "detail": "26.2144"
+  },
+  {
+   "id": "GP-02",
+   "axis": "device/bandwidth",
+   "ok": true,
+   "detail": "102.4"
+  },
+  {
+   "id": "GP-03",
+   "axis": "device/t4-roofline",
+   "ok": true,
+   "detail": "25.44"
+  },
+  {
+   "id": "GP-04",
+   "axis": "memory/coalescing",
+   "ok": true,
+   "detail": "1"
+  },
+  {
+   "id": "GP-05",
+   "axis": "memory/coalescing",
+   "ok": true,
+   "detail": "32"
+  },
+  {
+   "id": "GP-06",
+   "axis": "costmodel/roofline",
+   "ok": true,
+   "detail": "256.0"
+  },
+  {
+   "id": "GP-07",
+   "axis": "warp/divergence",
+   "ok": true,
+   "detail": "1.0"
+  },
+  {
+   "id": "GP-08",
+   "axis": "schedule/wave",
+   "ok": true,
+   "detail": "20"
+  },
+  {
+   "id": "GP-09",
+   "axis": "schedule/wave",
+   "ok": true,
+   "detail": "raised ValueError"
+  },
+  {
+   "id": "GP-10",
+   "axis": "schedule/gemm-tiling",
+   "ok": true,
+   "detail": "100"
+  },
+  {
+   "id": "GP-11",
+   "axis": "schedule/recommend",
+   "ok": true,
+   "detail": "split-k"
+  },
+  {
+   "id": "GP-12",
+   "axis": "schedule/streamk",
+   "ok": true,
+   "detail": "39"
+  },
+  {
+   "id": "GP-13",
+   "axis": "ops/softmax",
+   "ok": true,
+   "detail": "True"
+  },
+  {
+   "id": "GP-14",
+   "axis": "ops/softmax",
+   "ok": true,
+   "detail": "raised ValueError"
+  },
+  {
+   "id": "GP-15",
+   "axis": "ops/matmul",
+   "ok": true,
+   "detail": "True"
+  },
+  {
+   "id": "GP-16",
+   "axis": "ops/matmul",
+   "ok": true,
+   "detail": "raised ValueError"
+  },
+  {
+   "id": "GP-17",
+   "axis": "smem/bank-conflict",
+   "ok": true,
+   "detail": "992"
+  },
+  {
+   "id": "GP-18",
+   "axis": "smem/padding",
+   "ok": true,
+   "detail": "0"
+  },
+  {
+   "id": "GP-19",
+   "axis": "doc/readme",
+   "ok": true,
+   "detail": "峰值 FP32 算力 | 26.2144 TFLOPS"
+  },
+  {
+   "id": "GP-20",
+   "axis": "doc/readme",
+   "ok": true,
+   "detail": "256×256×8192 | stream-K | 2048 | 52 | 0."
+  }
+ ]
+}

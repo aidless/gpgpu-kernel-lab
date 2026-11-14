@@ -6,4 +6,5 @@
 .PHONY: eval
 
 eval:
+	python3 eval/run_cases.py
 	PYTHONPATH=src python3 -m pytest

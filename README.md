@@ -436,3 +436,87 @@ README/文档里出现的每个数值（26.2144 TFLOPS、102.4 GB/s、64/2048 �
 ## 许可证
 
 Apache-2.0，见 [LICENSE](LICENSE)。
+
+---
+
+## 验收标准与复算
+
+本仓判为合格的条件是 `python3 eval/run_cases.py` 通过率必须为 100%（20/20），且 `make eval` 退出码必须为 0；任何一条失败即判为不合格。
+
+**这是一条硬线，没有分档**：19/20 和 0/20 在判据上等价（都是不合格）。想让阈值松动，
+必须同时改这一句和 `eval/cases.jsonl`，不能只改一边——否则「文档说 100%、题库只跑到 19」
+就是一句有出处的假话。
+
+### 题库：`eval/cases.jsonl`（20 条，七键 `id/axis/question/expected/mode/verify/source`）
+
+| axis | 条数 | 这个轴在问什么 | 代表题 |
+|---|---:|---|---|
+| `device/peak` | 1 | 设备解析峰值算力（公式而非实测） | `DeviceInfo().peak_flops_tflops` = 26.2144 TFLOPS |
+| `device/bandwidth` | 1 | 理论显存带宽 | `theoretical_bandwidth_gbps` = 102.4 GB/s |
+| `device/t4-roofline` | 1 | 换一张卡（T4）交叉点是否跟着变 | `crossover_intensity(DeviceInfo.tesla_t4())` = 25.44 FLOP/B |
+| `memory/coalescing` | 2 | 128B 事务计数：连续 vs 跨步 | 相邻 lane 1 个事务；跨步 32 元素 32 个 |
+| `costmodel/roofline` | 1 | 假设机的 roofline 交叉点 | 256.0 FLOP/B |
+| `warp/divergence` | 1 | 分支发散的实测发散率 | `relu_branchy` 正负混合 → 1.0 |
+| `schedule/wave` | 2 | 波量化的末波单元数与非法入参 | `wave_stats(100, 40)` 末波 20；`units=0` 抛 `ValueError` |
+| `schedule/gemm-tiling` | 1 | 输出 tile 数（工作单元粒度） | 1280×1280×528 / 128² → 100 |
+| `schedule/recommend` | 1 | 结论随形状翻转 | T4 上 1280×1280×528 → `split-k` |
+| `schedule/streamk` | 1 | 部分和份数必须从真实划分数出来 | `streamk_partials(...)` = 39（不是闭式 `capacity-1` 猜的） |
+| `ops/softmax` | 2 | 行和归一到 1 + BLOCK_N 护栏 | 8×32 行和偏差 < 1e-5；`block_n=8 < N=16` 抛 `ValueError` |
+| `ops/matmul` | 2 | 分块 GEMM 对拍 numpy + K%BK 护栏 | 64×32 @ 32×48 误差 < 1e-4；`bk=12` 抛 `ValueError` |
+| `smem/bank-conflict` | 1 | 行宽 32 的按列读冲突轮次 | `run_smem_column(32)` → 992 |
+| `smem/padding` | 1 | 行宽 33（+1 padding）冲突归零 | `run_smem_column(33)` → 0 |
+| `doc/readme` | 2 | 文档数字与代码是否仍然一致 | README 的 26.2144 TFLOPS 行、256×256×8192 stream-K 行 |
+
+模式分布：`expr` 15 条（真调本仓 API 后取 `result`）、`raises` 3 条（断言异常类型名）、
+`doc` 2 条（`文件::正则`，只解析本仓文档）。**18 条 expr/raises 全部真跑本仓代码**，
+期望值不是抄 README 来的——改一行实现就会变红，这正是这套题存在的意义。
+
+### 三条命令
+
+```bash
+python3 eval/run_cases.py            # 期望 20/20，rc=0
+python3 eval/run_cases.py --selftest # 期望 19/20，rc=0（把 GP-01 的期望砸成不可能值，必须变红）
+make eval; echo rc=$?                # 期望 rc=0（先跑题库，再跑 154 条 pytest）
+```
+
+`--selftest` 的语义是「证明这套题不是装饰」：它把第一条 case 的 `expected` 篡改成
+`__selftest_impossible_value__`，若仍然 20/20 说明比较逻辑失效（`run_cases.py` 会返回 rc=3）。
+这是 AGENTS.md 第 8/21 条的红→绿两段断言在本题库上的落地。
+
+### 数字怎么复算
+
+1. **期望值全部来自代码**：`expr` 题的 `result` 由 `verify` 里那段代码当场算出，
+   `python3 eval/run_cases.py --save` 会把逐条结果写到 `eval/run-report.json`
+   （`total/passed/failed/failed_by_axis/results`），可以逐条对上。
+2. **与既有闸交叉**：`scripts/verify_numbers.py` 的 `EXPECTED` 表覆盖同一批数字
+   （26.2144 / 102.4 / 256.0 / 992 / 0 ……）。两处不一致说明文档或代码其中一处漂移了，
+   不是「以谁为准」的选择题——先改代码再重算两边。
+3. **复算入口不用安装**：题库和 pytest 都走 `PYTHONPATH=src`（src-layout，裸克隆没装也能跑）。
+   `eval/cases.jsonl` 每条 `verify` 第一行自己把 `src/` 塞进 `sys.path`，所以
+   `python3 eval/run_cases.py` 在仓库根直接可用，不依赖环境变量。
+4. **不许把测量结果当判据**：本题库里没有「耗时 < X ms」这类题目。`bench.json` 里的
+   `wall_ms` 是逐 block 走 Python 循环跑出来的，随机器抖动，把它写进 `expected` 等于
+   把测量当标准。判据只钉**解析值、整数计数、等式与异常类型**。
+
+### 失败归因（按 axis）
+
+`run_cases.py` 不只报一个 `pass_rate`，失败时按 axis 汇总（`failed_by_axis`），
+因为「哪一轴红了」比「红了 1 条」信息量大得多。`--selftest` 的真实输出是：
+
+```
+19/20 cases passed
+失败归因（按 axis）：
+  device/peak: 1 条 —— GP-01
+SELFTEST: 期望变红；若上面仍全绿则这套题无效
+```
+
+三条判读规则（照这个表定位，别一条条猜）：
+
+| 现象 | 归因 | 处置 |
+|---|---|---|
+| 同一 axis 的 expr **和** raises 一起红 | 该模块接口/签名被改（如 `DeviceInfo` 默认参数、`wave_stats` 改名） | 读报错栈定位到 `source` 指的那行，先修实现再决定是否改题 |
+| 只有 expr 红、raises 绿 | 数值漂移，不是签名破坏（典型：`peak_flops` 公式或 `shared_bank_conflicts` 计数口径变了） | 用 `verify_numbers.py` 复算确认新值，改代码或改题**两处同改** |
+| `doc/readme` 红而 expr 全绿 | 文档漂移：代码是对的，README 的数字没跟着改 | 只改 README（本仓历史上漂移过两次：58→68→74→135 个测试函数） |
+
+`make eval` 的两段也是有意的：题库红说明「判据本身站不住」，pytest 红说明「实现坏了」。
+两者同时红时先看 pytest——实现坏了，题库红只是它的回声。
