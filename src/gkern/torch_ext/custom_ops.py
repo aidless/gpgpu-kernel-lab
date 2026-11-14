@@ -14,10 +14,8 @@
 
 from __future__ import annotations
 
-from typing import Tuple
 
 import torch
-import torch.nn.functional as F
 
 from ..ops import run_fused_mlp, run_scale_gelu
 

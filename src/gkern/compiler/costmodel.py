@@ -18,7 +18,6 @@ GPU 优化的第一性问题永远是「这个 kernel 是带宽受限还是算�
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
 
 import numpy as np
 

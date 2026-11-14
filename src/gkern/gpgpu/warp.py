@@ -17,8 +17,8 @@ warp 里的 lane 走进不同的分支，硬件不能并行执行两条路径，
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from dataclasses import dataclass
+from typing import Callable, Optional
 
 import numpy as np
 

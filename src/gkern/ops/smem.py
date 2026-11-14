@@ -14,7 +14,6 @@ bank 0，32 路冲突；把行宽改成 33（末尾多 1 个 padding），下标
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
 
 import numpy as np
 

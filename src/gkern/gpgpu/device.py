@@ -15,7 +15,7 @@ Python 里能被真正展开，而不是被当成一次标量调用。
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterator, List, Sequence
 
 

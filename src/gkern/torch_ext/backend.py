@@ -8,7 +8,7 @@ Dynamo 负责抓图，我们把图**接过来自己编译**，而不是交给 in
 
 from __future__ import annotations
 
-from typing import Any, Callable, List
+from typing import Any, Callable
 
 import torch
 import torch.fx as fx

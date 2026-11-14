@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from gkern.compiler import codegen, compile_kernel, costmodel
+from gkern.compiler import codegen, compile_kernel
 from gkern.compiler import dsl as tl
 from gkern.compiler.passes import can_fuse, fuse_programs
 from gkern.ops import matmul, run_fused_mlp, run_scale_gelu, run_softmax, run_vector_add

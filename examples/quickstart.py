@@ -12,7 +12,6 @@ import numpy as np
 
 import torch
 
-from gkern.compiler import costmodel
 from gkern.gpgpu import device, samples
 from gkern.ops import run_fused_mlp, run_matmul, run_softmax, run_vector_add
 

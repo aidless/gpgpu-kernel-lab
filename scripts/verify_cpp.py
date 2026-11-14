@@ -110,7 +110,7 @@ def main() -> None:
     cpp_bank = (time.perf_counter() - t0) / 5
 
     print(f"ok   语义对拍：{checked} 组随机/边界输入全部一致")
-    print(f"ok   非法参数校验：3/3 抛错")
+    print("ok   非法参数校验：3/3 抛错")
     print(f"     count_transactions  1M 个偏移：numpy {py_tx * 1e3:.2f} ms / "
           f"C++ {cpp_tx * 1e3:.2f} ms → {py_tx / cpp_tx:.2f}×")
     print(f"     warp_bank_conflicts 1M 个索引：numpy {py_bank * 1e3:.2f} ms / "
